@@ -1,3 +1,0 @@
-aiogram==3.13.1
-aiohttp==3.10.10
-pycryptodome==3.21.0

@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
 PAGE_SIZE = 5
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("9194874168:AAGnsgFQhXzwVccg52aJsHlHFhpmZCtEhbs", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Укажи токен: export BOT_TOKEN='...'")
 

@@ -67,6 +67,10 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 
 def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_text: str = "") -> dict[str, Any]:
+    """
+    Steam login check.
+    success / requires_twofactor / emailauth → working
+    """
     headers = {
         "User-Agent": UA,
         "Referer": "https://steamcommunity.com/login/home/?goto=",
@@ -74,24 +78,26 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
         "Origin": "https://steamcommunity.com",
         "X-Requested-With": "XMLHttpRequest",
     }
+    session = requests.Session()
+    session.headers.update(headers)
+
     try:
-        r = requests.get(
-            "https://steamcommunity.com/login/getrsakey",
+        r = session.get(
+            "https://steamcommunity.com/login/getrsakey/",
             params={"username": username, "donotcache": int(time.time() * 1000)},
-            headers=headers,
-            timeout=15,
+            timeout=20,
         )
         rsa = r.json()
-    except Exception:
-        return {"status": "error", "message": "Ошибка сети (RSA)"}
+    except Exception as e:
+        return {"status": "error", "message": f"Ошибка сети (RSA)"}
 
-    if not rsa or not rsa.get("success"):
+    if not isinstance(rsa, dict) or not rsa.get("success"):
         return {"status": "error", "message": "Аккаунт не работает"}
 
     try:
         enc_pass = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
     except Exception:
-        return {"status": "error", "message": "Аккаунт не работает"}
+        return {"status": "error", "message": "Ошибка шифрования пароля"}
 
     payload = {
         "username": username,
@@ -102,18 +108,25 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
         "captchagid": captcha_gid or "-1",
         "captcha_text": captcha_text or "",
         "emailsteamid": "",
-        "rsatimestamp": rsa["timestamp"],
+        "rsatimestamp": str(rsa.get("timestamp", "")),
         "remember_login": "false",
         "donotcache": str(int(time.time() * 1000)),
     }
+
     try:
-        r = requests.post(
+        r = session.post(
             "https://steamcommunity.com/login/dologin/",
             data=payload,
-            headers={**headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
-            timeout=15,
+            timeout=20,
         )
-        data = r.json()
+        # sometimes HTML / rate limit
+        try:
+            data = r.json()
+        except Exception:
+            body = (r.text or "")[:200].lower()
+            if "too many" in body or "rate" in body:
+                return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
+            return {"status": "error", "message": "Непонятный ответ Steam"}
     except Exception:
         return {"status": "error", "message": "Ошибка сети (login)"}
 
@@ -121,18 +134,50 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
         return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
     if not isinstance(data, dict):
         return {"status": "error", "message": "Аккаунт не работает"}
+
+    # Full login OK
     if data.get("success") is True:
         return {"status": "success", "message": "Аккаунт работает"}
-    if data.get("requires_twofactor") or data.get("emailauth_needed") or data.get("emailsteamid"):
+
+    # Password correct, Guard / email needed → account WORKS
+    if (
+        data.get("requires_twofactor")
+        or data.get("emailauth_needed")
+        or data.get("emailsteamid")
+        or data.get("requires_twofactor") is True
+    ):
         return {"status": "success", "message": "Аккаунт работает (Steam Guard / 2FA)"}
+
+    # captcha
     if data.get("captcha_needed"):
-        return {"status": "captcha", "message": "Требуется капча", "captcha_gid": str(data.get("captcha_gid") or "-1")}
-    msg = str(data.get("message") or data.get("strError") or "").lower()
-    if "too many" in msg or "rate" in msg:
+        return {
+            "status": "captcha",
+            "message": "Требуется капча",
+            "captcha_gid": str(data.get("captcha_gid") or "-1"),
+        }
+
+    msg = str(data.get("message") or data.get("strError") or "")
+    msg_l = msg.lower()
+
+    # wrong password / account
+    if any(x in msg_l for x in ("incorrect", "invalid", "password", "неверн", "ошибка")):
+        return {"status": "error", "message": "Аккаунт не работает"}
+
+    if "too many" in msg_l or "rate" in msg_l or "try again" in msg_l:
         return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
+
+    # unknown but has transfer_parameters / login_complete hints
+    if data.get("login_complete") or data.get("transfer_urls") or data.get("transfer_parameters"):
+        return {"status": "success", "message": "Аккаунт работает"}
+
+    # If message empty but not clear failure — still report not working with debug hint
+    if msg:
+        return {"status": "error", "message": f"Аккаунт не работает ({msg[:80]})"}
     return {"status": "error", "message": "Аккаунт не работает"}
 
+
 # ===== end steam check =====
+
 
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
@@ -434,6 +479,7 @@ def cmd_start(message: types.Message):
         f"<b>Основной список</b>\n"
         f"• Напиши игру или /find\n"
         f"• /random\n"
+        f"• /catalog — весь основной список\n"
         f"• /check логин пароль\n\n"
         f"<b>От пользователей</b> (отдельный раздел)\n"
         f"• /users — все добавленные\n"
@@ -449,6 +495,20 @@ def cmd_random(message: types.Message):
     a = random.choice(ACCOUNTS)
     set_ctx(message.from_user.id, [a], "main")
     bot.reply_to(message, fmt_acc(a, 1, "main"), reply_markup=acc_kb(0, 0))
+
+
+@bot.message_handler(commands=["catalog", "all", "list"])
+def cmd_catalog(message: types.Message):
+    """Каталог всех аккаунтов основного списка."""
+    uid = message.from_user.id
+    set_ctx(uid, ACCOUNTS, "main")
+    bot.reply_to(
+        message,
+        f"📂 <b>Каталог основного списка</b>\n"
+        f"Всего: <b>{len(ACCOUNTS)}</b>\n"
+        f"Листай страницами или ищи через /find:",
+        reply_markup=page_kb(uid, 0),
+    )
 
 
 @bot.message_handler(commands=["find"])

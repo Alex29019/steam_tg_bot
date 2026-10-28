@@ -1,5 +1,5 @@
 """
-Steam TG Bot — Web Service (webhook + Flask).
+Steam TG Bot — Web Service
 Start: gunicorn -b 0.0.0.0:$PORT bot:app
 Env: BOT_TOKEN, WEBHOOK_URL
 """
@@ -9,6 +9,7 @@ import json
 import os
 import random
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -135,6 +136,7 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
 
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
+STATUS_FILE = ROOT / "check_status.json"
 PAGE_SIZE = 8
 CHECK_COOLDOWN = 60
 
@@ -145,13 +147,58 @@ if not BOT_TOKEN:
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
+# Moscow time for display
+MSK = timezone(timedelta(hours=3))
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
 user_results: dict[int, list] = {}
 last_check: dict[int, float] = {}
-# uid -> {login, password, captcha_gid} waiting for captcha text
 pending_captcha: dict[int, dict] = {}
+
+
+def load_status() -> dict:
+    try:
+        if STATUS_FILE.exists():
+            return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_status(data: dict) -> None:
+    try:
+        STATUS_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print("save_status error:", e)
+
+
+def set_check_result(login: str, status: str, message: str = "") -> dict:
+    """status: ok | bad | captcha"""
+    data = load_status()
+    now = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
+    entry = {"status": status, "at": now, "message": message or ""}
+    data[login] = entry
+    save_status(data)
+    return entry
+
+
+def get_check_result(login: str) -> dict | None:
+    return load_status().get(login)
+
+
+def status_line(login: str) -> str:
+    st = get_check_result(login)
+    if not st:
+        return "➖ Ещё не проверяли"
+    s = st.get("status")
+    at = st.get("at") or "?"
+    if s == "ok":
+        return f"✅ Проверен: <b>работает</b> · {esc(at)}"
+    if s == "bad":
+        return f"❌ Проверен: <b>не работает</b> · {esc(at)}"
+    return f"⚠️ Проверен: {esc(st.get('message') or s)} · {esc(at)}"
 
 
 def esc(s: str) -> str:
@@ -180,8 +227,17 @@ def page_kb(uid: int, page: int) -> types.InlineKeyboardMarkup:
     for i, a in enumerate(found[start : start + PAGE_SIZE]):
         idx = start + i
         games = a.get("g") or a.get("l") or "?"
-        short = games if len(games) <= 40 else games[:37] + "..."
-        kb.add(types.InlineKeyboardButton(f"{idx + 1}. {short}", callback_data=f"a:{idx}:{page}"))
+        short = games if len(games) <= 36 else games[:33] + "..."
+        st = get_check_result(a.get("l") or "")
+        mark = ""
+        if st:
+            if st.get("status") == "ok":
+                mark = "✅ "
+            elif st.get("status") == "bad":
+                mark = "❌ "
+            else:
+                mark = "⚠️ "
+        kb.add(types.InlineKeyboardButton(f"{mark}{idx + 1}. {short}", callback_data=f"a:{idx}:{page}"))
     nav = []
     if page > 0:
         nav.append(types.InlineKeyboardButton("← Назад", callback_data=f"p:{page - 1}"))
@@ -193,19 +249,8 @@ def page_kb(uid: int, page: int) -> types.InlineKeyboardMarkup:
     return kb
 
 
-def acc_kb(idx: int, page: int, login: str, password: str) -> types.InlineKeyboardMarkup:
+def acc_kb(idx: int, page: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
-    # copy_text (Bot API) — one tap copy; fallback handled in callback if needed
-    try:
-        kb.row(
-            types.InlineKeyboardButton("📋 Логин", copy_text=types.CopyTextButton(text=login or "")),
-            types.InlineKeyboardButton("📋 Пароль", copy_text=types.CopyTextButton(text=password or "")),
-        )
-    except Exception:
-        kb.row(
-            types.InlineKeyboardButton("📋 Логин", callback_data=f"cl:{idx}"),
-            types.InlineKeyboardButton("📋 Пароль", callback_data=f"cp:{idx}"),
-        )
     kb.add(types.InlineKeyboardButton("✅ Проверить", callback_data=f"c:{idx}"))
     kb.add(types.InlineKeyboardButton("« К списку", callback_data=f"p:{page}"))
     return kb
@@ -216,7 +261,8 @@ def fmt_acc(a: dict, n: int | None = None) -> str:
     return (
         f"{head}🎮 <b>{esc(a.get('g') or '—')}</b>\n\n"
         f"👤 Логин:\n<code>{esc(a.get('l'))}</code>\n\n"
-        f"🔑 Пароль:\n<code>{esc(a.get('p'))}</code>"
+        f"🔑 Пароль:\n<code>{esc(a.get('p'))}</code>\n\n"
+        f"{status_line(a.get('l') or '')}"
     )
 
 
@@ -234,16 +280,26 @@ def fetch_captcha_image(gid: str) -> bytes | None:
     return None
 
 
+def apply_result(login: str, result: dict) -> str:
+    status = result.get("status")
+    msg = result.get("message") or status
+    if status == "success":
+        set_check_result(login, "ok", msg)
+        return f"✅ <b>{esc(msg)}</b>\n👤 <code>{esc(login)}</code>\n\n{status_line(login)}"
+    if status == "captcha":
+        return "captcha"
+    set_check_result(login, "bad", msg)
+    return f"❌ <b>{esc(msg)}</b>\n👤 <code>{esc(login)}</code>\n\n{status_line(login)}"
+
+
 def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: str = "-1", captcha_text: str = ""):
     wait = bot.send_message(chat_id, "⏳ Проверка Steam...")
     result = check_steam(login, password, captcha_gid, captcha_text)
     status = result.get("status")
-    msg = result.get("message") or status
 
     if status == "captcha":
         gid = str(result.get("captcha_gid") or "-1")
         pending_captcha[uid] = {"login": login, "password": password, "captcha_gid": gid}
-        img = fetch_captcha_image(gid)
         text = (
             "⚠️ Steam просит <b>капчу</b>.\n"
             "Введи символы с картинки <b>следующим сообщением</b>."
@@ -252,17 +308,12 @@ def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: st
             bot.edit_message_text(text, chat_id, wait.message_id)
         except Exception:
             bot.send_message(chat_id, text)
+        img = fetch_captcha_image(gid)
         if img:
             bot.send_photo(chat_id, img, caption="Капча Steam — ответь текстом с картинки")
-        else:
-            bot.send_message(chat_id, f"Не удалось загрузить картинку. GID: <code>{esc(gid)}</code>")
         return
 
-    pending_captcha.pop(uid, None)
-    if status == "success":
-        text = f"✅ <b>{esc(msg)}</b>\n👤 <code>{esc(login)}</code>"
-    else:
-        text = f"❌ <b>{esc(msg)}</b>\n👤 <code>{esc(login)}</code>"
+    text = apply_result(login, result)
     try:
         bot.edit_message_text(text, chat_id, wait.message_id)
     except Exception:
@@ -274,9 +325,12 @@ def cmd_start(message: types.Message):
     bot.reply_to(
         message,
         f"Steam Accounts Bot\nВсего: <b>{len(ACCOUNTS)}</b>\n\n"
-        f"Напиши игру для поиска или /find /random\n"
-        f"Проверка — не чаще 1 раза в минуту.\n"
-        f"Если Steam просит капчу — пришлём картинку, ответь текстом.",
+        f"• Напиши игру — поиск\n"
+        f"• /find <i>игра</i>\n"
+        f"• /random\n"
+        f"• /check <i>логин пароль</i> — проверка\n\n"
+        f"После проверки у аккаунта видна пометка (работает / не работает) и дата — для всех.\n"
+        f"Лимит проверки: 1 раз в минуту.",
     )
 
 
@@ -284,17 +338,30 @@ def cmd_start(message: types.Message):
 def cmd_random(message: types.Message):
     a = random.choice(ACCOUNTS)
     user_results[message.from_user.id] = [a]
-    bot.reply_to(
-        message,
-        fmt_acc(a, 1),
-        reply_markup=acc_kb(0, 0, a.get("l") or "", a.get("p") or ""),
-    )
+    bot.reply_to(message, fmt_acc(a, 1), reply_markup=acc_kb(0, 0))
 
 
 @bot.message_handler(commands=["find"])
 def cmd_find(message: types.Message):
     parts = (message.text or "").split(maxsplit=1)
     do_search(message, parts[1].strip() if len(parts) > 1 else "")
+
+
+@bot.message_handler(commands=["check"])
+def cmd_check(message: types.Message):
+    uid = message.from_user.id
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Формат: <code>/check логин пароль</code>")
+        return
+    login, password = parts[1], parts[2]
+    now = time.time()
+    left = int(CHECK_COOLDOWN - (now - last_check.get(uid, 0)))
+    if left > 0:
+        bot.reply_to(message, f"⏳ Подожди ещё <b>{left}</b> сек.", parse_mode="HTML")
+        return
+    last_check[uid] = now
+    run_check(message.chat.id, uid, login, password)
 
 
 def do_search(message: types.Message, q: str):
@@ -309,7 +376,7 @@ def do_search(message: types.Message, q: str):
     user_results[uid] = found
     bot.reply_to(
         message,
-        f"Найдено: <b>{len(found)}</b>\nВыбери аккаунт:",
+        f"Найдено: <b>{len(found)}</b>\n✅/❌ — уже проверенные\nВыбери аккаунт:",
         reply_markup=page_kb(uid, 0),
     )
 
@@ -354,28 +421,8 @@ def on_callback(cq: types.CallbackQuery):
             bot.answer_callback_query(cq.id, "Сделай поиск снова", show_alert=True)
             return
         a = found[idx]
-        bot.send_message(
-            cq.message.chat.id,
-            fmt_acc(a, idx + 1),
-            reply_markup=acc_kb(idx, page, a.get("l") or "", a.get("p") or ""),
-        )
+        bot.send_message(cq.message.chat.id, fmt_acc(a, idx + 1), reply_markup=acc_kb(idx, page))
         bot.answer_callback_query(cq.id)
-        return
-
-    # fallback copy buttons
-    if data.startswith("cl:") or data.startswith("cp:"):
-        try:
-            idx = int(data.split(":")[1])
-        except Exception:
-            bot.answer_callback_query(cq.id)
-            return
-        if idx < 0 or idx >= len(found):
-            bot.answer_callback_query(cq.id, "Сделай поиск снова", show_alert=True)
-            return
-        a = found[idx]
-        val = a.get("l") if data.startswith("cl:") else a.get("p")
-        bot.send_message(cq.message.chat.id, f"<code>{esc(val)}</code>")
-        bot.answer_callback_query(cq.id, "Скопируй из сообщения")
         return
 
     if data.startswith("c:"):
@@ -405,8 +452,6 @@ def on_callback(cq: types.CallbackQuery):
 def on_text(message: types.Message):
     uid = message.from_user.id
     text = (message.text or "").strip()
-
-    # If waiting captcha — this message is captcha solution
     if uid in pending_captcha:
         pend = pending_captcha.pop(uid)
         run_check(
@@ -418,13 +463,17 @@ def on_text(message: types.Message):
             text,
         )
         return
-
     do_search(message, text)
 
 
 @app.get("/")
 def health():
-    return {"ok": True, "accounts": len(ACCOUNTS), "webhook": bool(WEBHOOK_URL)}, 200
+    return {
+        "ok": True,
+        "accounts": len(ACCOUNTS),
+        "webhook": bool(WEBHOOK_URL),
+        "checked": len(load_status()),
+    }, 200
 
 
 @app.post("/webhook")

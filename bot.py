@@ -405,16 +405,21 @@ def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: st
 
     if status == "captcha":
         gid = str(result.get("captcha_gid") or "-1")
+        st = add_state.get(uid) or {}
         pending_captcha[uid] = {
             "login": login,
             "password": password,
             "captcha_gid": gid,
             "after_ok": after_ok is not None,
+            # контекст /add (если есть)
+            "is_add": after_ok is not None or st.get("step") == "checking",
+            "games": st.get("games") or "",
+            "by": st.get("by") or "",
         }
-        if after_ok is not None:
-            st = add_state.get(uid) or {}
+        if after_ok is not None or st.get("step") == "checking":
             add_state[uid] = {
                 **st,
+                "step": "checking",
                 "await_captcha_add": True,
                 "login": login,
                 "password": password,
@@ -725,21 +730,36 @@ def on_text(message: types.Message):
     uid = message.from_user.id
     text = (message.text or "").strip()
 
-    # captcha reply
+    # captcha reply (и для /check, и для кнопки, и для /add)
     if uid in pending_captcha:
         pend = pending_captcha.pop(uid)
         login = pend.get("login") or ""
         password = pend.get("password") or ""
         gid = pend.get("captcha_gid") or "-1"
-        # if this was part of /add
         st = add_state.get(uid) or {}
-        if st.get("await_captcha_add") or st.get("step") == "checking":
-            def after_ok(l, p):
-                games = st.get("games") or "?"
-                uname = message.from_user.username or message.from_user.first_name or str(uid)
-                finish_add_account(message.chat.id, uid, l, p, games, uname)
+        is_add = (
+            pend.get("is_add")
+            or pend.get("after_ok")
+            or st.get("await_captcha_add")
+            or st.get("step") == "checking"
+        )
+        if is_add:
+            games = pend.get("games") or st.get("games") or "?"
+            uname = (
+                pend.get("by")
+                or st.get("by")
+                or message.from_user.username
+                or message.from_user.first_name
+                or str(uid)
+            )
+
+            def after_ok(l, p, _games=games, _uname=uname):
+                finish_add_account(message.chat.id, uid, l, p, _games, _uname)
+
+            bot.reply_to(message, "⏳ Проверяю капчу и аккаунт для добавления...")
             run_check(message.chat.id, uid, login, password, gid, text, after_ok=after_ok)
             return
+        bot.reply_to(message, "⏳ Проверяю с капчей...")
         run_check(message.chat.id, uid, login, password, gid, text)
         return
 
@@ -780,18 +800,24 @@ def on_text(message: types.Message):
                 add_state.pop(uid, None)
                 return
             last_check[uid] = now
+            uname = message.from_user.username or message.from_user.first_name or str(uid)
             add_state[uid] = {
                 "step": "checking",
                 "login": login,
                 "password": password,
                 "games": games,
+                "by": uname,
+                "await_captcha_add": False,
             }
-            uname = message.from_user.username or message.from_user.first_name or str(uid)
 
             def after_ok(l, p):
                 finish_add_account(message.chat.id, uid, l, p, games, uname)
 
-            bot.reply_to(message, "Проверяю аккаунт на Steam перед добавлением...")
+            bot.reply_to(
+                message,
+                "Проверяю аккаунт на Steam перед добавлением...\n"
+                "Если попросят капчу — пришлю картинку, ответь текстом.",
+            )
             run_check(message.chat.id, uid, login, password, after_ok=after_ok)
             return
 

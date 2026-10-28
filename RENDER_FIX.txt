@@ -1,7 +1,0 @@
-На Render в Environment добавь:
-  PYTHON_VERSION = 3.12.8
-
-Или положи runtime.txt с содержимым:
-  python-3.12.8
-
-Потом Manual Deploy.

@@ -148,13 +148,14 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
     ):
         return {"status": "success", "message": "Аккаунт работает (Steam Guard / 2FA)"}
 
-    # captcha
-    if data.get("captcha_needed"):
-        return {
-            "status": "captcha",
-            "message": "Требуется капча",
-            "captcha_gid": str(data.get("captcha_gid") or "-1"),
-        }
+    # captcha (any form)
+    if data.get("captcha_needed") or data.get("captcha_gid") not in (None, "", "-1", -1):
+        if data.get("captcha_needed") or (not data.get("success") and data.get("captcha_gid")):
+            return {
+                "status": "captcha",
+                "message": "Требуется капча",
+                "captcha_gid": str(data.get("captcha_gid") or "-1"),
+            }
 
     msg = str(data.get("message") or data.get("strError") or "")
     msg_l = msg.lower()
@@ -365,16 +366,22 @@ def fmt_acc(a: dict, n: int | None = None, source: str = "main") -> str:
 
 
 def fetch_captcha_image(gid: str) -> bytes | None:
+    if not gid or gid == "-1":
+        return None
     try:
         r = requests.get(
             f"https://steamcommunity.com/login/rendercaptcha/?gid={gid}",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
+            headers={
+                "User-Agent": UA,
+                "Referer": "https://steamcommunity.com/login/home/",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+            timeout=20,
         )
-        if r.status_code == 200 and r.content:
+        if r.status_code == 200 and r.content and len(r.content) > 100:
             return r.content
-    except Exception:
-        pass
+    except Exception as e:
+        print("captcha image error:", e)
     return None
 
 
@@ -391,7 +398,7 @@ def apply_result(login: str, result: dict) -> str:
 
 
 def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: str = "-1", captcha_text: str = "", after_ok=None):
-    """after_ok(login, password) called when success — for /add flow."""
+    """Единая проверка: /check, кнопка Проверить, /add — везде одна логика + капча."""
     wait = bot.send_message(chat_id, "⏳ Проверка Steam...")
     result = check_steam(login, password, captcha_gid, captcha_text)
     status = result.get("status")
@@ -404,17 +411,36 @@ def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: st
             "captcha_gid": gid,
             "after_ok": after_ok is not None,
         }
-        # store after_ok marker in add_state if needed
         if after_ok is not None:
-            add_state[uid] = {**add_state.get(uid, {}), "await_captcha_add": True, "login": login, "password": password}
-        text = "⚠️ Steam просит <b>капчу</b>. Введи символы с картинки следующим сообщением."
+            st = add_state.get(uid) or {}
+            add_state[uid] = {
+                **st,
+                "await_captcha_add": True,
+                "login": login,
+                "password": password,
+            }
+        hint = (
+            "⚠️ Нужна <b>капча Steam</b>\n\n"
+            "Отправь символы с картинки <b>следующим сообщением</b>.\n"
+            "Это работает для /check, кнопки «Проверить» и /add.\n"
+            "Отмена: /cancel"
+        )
         try:
-            bot.edit_message_text(text, chat_id, wait.message_id)
+            bot.edit_message_text(hint, chat_id, wait.message_id)
         except Exception:
-            bot.send_message(chat_id, text)
+            bot.send_message(chat_id, hint)
         img = fetch_captcha_image(gid)
         if img:
-            bot.send_photo(chat_id, img, caption="Капча Steam")
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔄 Обновить капчу", callback_data="rc:0"))
+            bot.send_photo(
+                chat_id,
+                img,
+                caption="🔤 Напиши текст с картинки",
+                reply_markup=kb,
+            )
+        else:
+            bot.send_message(chat_id, "Картинку капчи загрузить не удалось. /cancel и попробуй снова.")
         return
 
     if status == "success":
@@ -431,11 +457,15 @@ def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: st
         set_check_result(login, "bad", result.get("message") or "")
         text = apply_result(login, result)
         if after_ok:
-            text = f"❌ Аккаунт не работает — в раздел пользователей <b>не добавлен</b>.\n{text}"
+            text = (
+                "❌ Аккаунт не работает — в раздел пользователей <b>не добавлен</b>.\n"
+                + text
+            )
     try:
         bot.edit_message_text(text, chat_id, wait.message_id)
     except Exception:
         bot.send_message(chat_id, text)
+
 
 
 def finish_add_account(chat_id: int, uid: int, login: str, password: str, games: str, username: str):
@@ -641,6 +671,30 @@ def on_callback(cq: types.CallbackQuery):
         a = found[idx]
         bot.send_message(cq.message.chat.id, fmt_acc(a, idx + 1, source), reply_markup=acc_kb(idx, page))
         bot.answer_callback_query(cq.id)
+        return
+
+    # refresh captcha
+    if data.startswith("rc:"):
+        pend = pending_captcha.get(uid)
+        if not pend:
+            bot.answer_callback_query(cq.id, "Нет активной капчи", show_alert=True)
+            return
+        bot.answer_callback_query(cq.id, "Новая проверка...")
+        st = add_state.get(uid) or {}
+        after = None
+        if pend.get("after_ok") or st.get("await_captcha_add") or st.get("step") == "checking":
+            def after(l, p, _uid=uid, _chat=cq.message.chat.id, _st=st):
+                games = _st.get("games") or "?"
+                uname = cq.from_user.username or cq.from_user.first_name or str(_uid)
+                finish_add_account(_chat, _uid, l, p, games, uname)
+            after = after
+        run_check(
+            cq.message.chat.id,
+            uid,
+            pend.get("login") or "",
+            pend.get("password") or "",
+            after_ok=after,
+        )
         return
 
     if data.startswith("c:"):

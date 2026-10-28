@@ -137,8 +137,9 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
 STATUS_FILE = ROOT / "check_status.json"
+USER_ACCOUNTS_FILE = ROOT / "user_accounts.json"
 PAGE_SIZE = 8
-CHECK_COOLDOWN = 60
+CHECK_COOLDOWN = 20
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -146,39 +147,54 @@ if not BOT_TOKEN:
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
-
-# Moscow time for display
 MSK = timezone(timedelta(hours=3))
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-user_results: dict[int, list] = {}
+# search context: uid -> {"list": [...], "source": "main"|"user"}
+user_results: dict[int, dict] = {}
 last_check: dict[int, float] = {}
 pending_captcha: dict[int, dict] = {}
+# uid -> step add flow
+add_state: dict[int, dict] = {}
+
+
+def now_str() -> str:
+    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
+
+
+def esc(s: str) -> str:
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def load_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def save_json(path: Path, data) -> None:
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=0), encoding="utf-8")
+    except Exception as e:
+        print("save error", path, e)
 
 
 def load_status() -> dict:
-    try:
-        if STATUS_FILE.exists():
-            return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+    return load_json(STATUS_FILE, {})
 
 
 def save_status(data: dict) -> None:
-    try:
-        STATUS_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        print("save_status error:", e)
+    save_json(STATUS_FILE, data)
 
 
 def set_check_result(login: str, status: str, message: str = "") -> dict:
-    """status: ok | bad | captcha"""
     data = load_status()
-    now = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
-    entry = {"status": status, "at": now, "message": message or ""}
+    entry = {"status": status, "at": now_str(), "message": message or ""}
     data[login] = entry
     save_status(data)
     return entry
@@ -201,16 +217,33 @@ def status_line(login: str) -> str:
     return f"⚠️ Проверен: {esc(st.get('message') or s)} · {esc(at)}"
 
 
-def esc(s: str) -> str:
-    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def load_user_accounts() -> list:
+    data = load_json(USER_ACCOUNTS_FILE, [])
+    return data if isinstance(data, list) else []
 
 
-def search_accounts(query: str) -> list:
+def save_user_accounts(items: list) -> None:
+    save_json(USER_ACCOUNTS_FILE, items)
+
+
+def login_exists_anywhere(login: str) -> str | None:
+    """Return where login exists: main|user|None"""
+    login_l = (login or "").strip().lower()
+    for a in ACCOUNTS:
+        if (a.get("l") or "").lower() == login_l:
+            return "main"
+    for a in load_user_accounts():
+        if (a.get("l") or "").lower() == login_l:
+            return "user"
+    return None
+
+
+def search_in(pool: list, query: str) -> list:
     q = (query or "").strip().lower()
     if len(q) < 2:
         return []
     out = []
-    for a in ACCOUNTS:
+    for a in pool:
         if q in (a.get("l") or "").lower() or q in (a.get("g") or "").lower():
             out.append(a)
             if len(out) >= 300:
@@ -218,8 +251,18 @@ def search_accounts(query: str) -> list:
     return out
 
 
+def get_ctx(uid: int) -> dict:
+    return user_results.get(uid) or {"list": [], "source": "main"}
+
+
+def set_ctx(uid: int, items: list, source: str) -> None:
+    user_results[uid] = {"list": items, "source": source}
+
+
 def page_kb(uid: int, page: int) -> types.InlineKeyboardMarkup:
-    found = user_results.get(uid) or []
+    ctx = get_ctx(uid)
+    found = ctx.get("list") or []
+    source = ctx.get("source") or "main"
     pages = max(1, (len(found) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     kb = types.InlineKeyboardMarkup()
@@ -237,7 +280,11 @@ def page_kb(uid: int, page: int) -> types.InlineKeyboardMarkup:
                 mark = "❌ "
             else:
                 mark = "⚠️ "
-        kb.add(types.InlineKeyboardButton(f"{mark}{idx + 1}. {short}", callback_data=f"a:{idx}:{page}"))
+        prefix = "👥 " if source == "user" else ""
+        kb.add(types.InlineKeyboardButton(
+            f"{mark}{prefix}{idx + 1}. {short}",
+            callback_data=f"a:{idx}:{page}",
+        ))
     nav = []
     if page > 0:
         nav.append(types.InlineKeyboardButton("← Назад", callback_data=f"p:{page - 1}"))
@@ -256,13 +303,19 @@ def acc_kb(idx: int, page: int) -> types.InlineKeyboardMarkup:
     return kb
 
 
-def fmt_acc(a: dict, n: int | None = None) -> str:
+def fmt_acc(a: dict, n: int | None = None, source: str = "main") -> str:
     head = f"<b>#{n}</b>\n" if n is not None else ""
+    tag = "👥 <i>От пользователей</i>\n" if source == "user" else ""
+    extra = ""
+    if source == "user":
+        by = a.get("by") or "?"
+        added = a.get("added") or "?"
+        extra = f"\n📎 Добавил: {esc(str(by))} · {esc(str(added))}"
     return (
-        f"{head}🎮 <b>{esc(a.get('g') or '—')}</b>\n\n"
+        f"{head}{tag}🎮 <b>{esc(a.get('g') or '—')}</b>\n\n"
         f"👤 Логин:\n<code>{esc(a.get('l'))}</code>\n\n"
         f"🔑 Пароль:\n<code>{esc(a.get('p'))}</code>\n\n"
-        f"{status_line(a.get('l') or '')}"
+        f"{status_line(a.get('l') or '')}{extra}"
     )
 
 
@@ -292,59 +345,160 @@ def apply_result(login: str, result: dict) -> str:
     return f"❌ <b>{esc(msg)}</b>\n👤 <code>{esc(login)}</code>\n\n{status_line(login)}"
 
 
-def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: str = "-1", captcha_text: str = ""):
+def run_check(chat_id: int, uid: int, login: str, password: str, captcha_gid: str = "-1", captcha_text: str = "", after_ok=None):
+    """after_ok(login, password) called when success — for /add flow."""
     wait = bot.send_message(chat_id, "⏳ Проверка Steam...")
     result = check_steam(login, password, captcha_gid, captcha_text)
     status = result.get("status")
 
     if status == "captcha":
         gid = str(result.get("captcha_gid") or "-1")
-        pending_captcha[uid] = {"login": login, "password": password, "captcha_gid": gid}
-        text = (
-            "⚠️ Steam просит <b>капчу</b>.\n"
-            "Введи символы с картинки <b>следующим сообщением</b>."
-        )
+        pending_captcha[uid] = {
+            "login": login,
+            "password": password,
+            "captcha_gid": gid,
+            "after_ok": after_ok is not None,
+        }
+        # store after_ok marker in add_state if needed
+        if after_ok is not None:
+            add_state[uid] = {**add_state.get(uid, {}), "await_captcha_add": True, "login": login, "password": password}
+        text = "⚠️ Steam просит <b>капчу</b>. Введи символы с картинки следующим сообщением."
         try:
             bot.edit_message_text(text, chat_id, wait.message_id)
         except Exception:
             bot.send_message(chat_id, text)
         img = fetch_captcha_image(gid)
         if img:
-            bot.send_photo(chat_id, img, caption="Капча Steam — ответь текстом с картинки")
+            bot.send_photo(chat_id, img, caption="Капча Steam")
         return
 
-    text = apply_result(login, result)
+    if status == "success":
+        set_check_result(login, "ok", result.get("message") or "")
+        if after_ok:
+            try:
+                bot.delete_message(chat_id, wait.message_id)
+            except Exception:
+                pass
+            after_ok(login, password)
+            return
+        text = apply_result(login, result)
+    else:
+        set_check_result(login, "bad", result.get("message") or "")
+        text = apply_result(login, result)
+        if after_ok:
+            text = f"❌ Аккаунт не работает — в раздел пользователей <b>не добавлен</b>.\n{text}"
     try:
         bot.edit_message_text(text, chat_id, wait.message_id)
     except Exception:
         bot.send_message(chat_id, text)
 
 
+def finish_add_account(chat_id: int, uid: int, login: str, password: str, games: str, username: str):
+    where = login_exists_anywhere(login)
+    if where == "main":
+        bot.send_message(chat_id, "❌ Этот логин уже есть в <b>основном</b> списке.")
+        add_state.pop(uid, None)
+        return
+    if where == "user":
+        bot.send_message(chat_id, "❌ Этот логин уже есть в разделе <b>от пользователей</b>.")
+        add_state.pop(uid, None)
+        return
+    items = load_user_accounts()
+    items.insert(0, {
+        "l": login.strip(),
+        "p": password,
+        "g": games.strip(),
+        "by": username or str(uid),
+        "added": now_str(),
+        "uid": uid,
+    })
+    save_user_accounts(items)
+    set_check_result(login.strip(), "ok", "Добавлен пользователем")
+    add_state.pop(uid, None)
+    bot.send_message(
+        chat_id,
+        f"✅ Аккаунт добавлен в раздел <b>От пользователей</b> (видно всем).\n\n"
+        f"👤 <code>{esc(login)}</code>\n🎮 {esc(games)}\n\n"
+        f"Смотреть: /users",
+    )
+
+
+# ----- commands -----
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message):
     bot.reply_to(
         message,
-        f"Steam Accounts Bot\nВсего: <b>{len(ACCOUNTS)}</b>\n\n"
-        f"• Напиши игру — поиск\n"
-        f"• /find <i>игра</i>\n"
+        f"Steam Accounts Bot\nОсновных: <b>{len(ACCOUNTS)}</b> · "
+        f"От пользователей: <b>{len(load_user_accounts())}</b>\n\n"
+        f"<b>Основной список</b>\n"
+        f"• Напиши игру или /find\n"
         f"• /random\n"
-        f"• /check <i>логин пароль</i> — проверка\n\n"
-        f"После проверки у аккаунта видна пометка (работает / не работает) и дата — для всех.\n"
-        f"Лимит проверки: 1 раз в минуту.",
+        f"• /check логин пароль\n\n"
+        f"<b>От пользователей</b> (отдельный раздел)\n"
+        f"• /users — все добавленные\n"
+        f"• /ufind игра — поиск там\n"
+        f"• /add — добавить свой аккаунт\n\n"
+        f"Добавление: аккаунт должен <b>работать</b> и <b>не быть</b> в списках. "
+        f"Укажи логин, пароль и игры. Проверка раз в 20 сек.",
     )
 
 
 @bot.message_handler(commands=["random"])
 def cmd_random(message: types.Message):
     a = random.choice(ACCOUNTS)
-    user_results[message.from_user.id] = [a]
-    bot.reply_to(message, fmt_acc(a, 1), reply_markup=acc_kb(0, 0))
+    set_ctx(message.from_user.id, [a], "main")
+    bot.reply_to(message, fmt_acc(a, 1, "main"), reply_markup=acc_kb(0, 0))
 
 
 @bot.message_handler(commands=["find"])
 def cmd_find(message: types.Message):
     parts = (message.text or "").split(maxsplit=1)
-    do_search(message, parts[1].strip() if len(parts) > 1 else "")
+    do_search(message, parts[1].strip() if len(parts) > 1 else "", source="main")
+
+
+@bot.message_handler(commands=["users", "user"])
+def cmd_users(message: types.Message):
+    items = load_user_accounts()
+    if not items:
+        bot.reply_to(message, "Раздел пуст. Добавь первый аккаунт: /add")
+        return
+    uid = message.from_user.id
+    set_ctx(uid, items, "user")
+    bot.reply_to(
+        message,
+        f"👥 <b>От пользователей</b>: {len(items)}\nВыбери аккаунт:",
+        reply_markup=page_kb(uid, 0),
+    )
+
+
+@bot.message_handler(commands=["ufind"])
+def cmd_ufind(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    do_search(message, parts[1].strip() if len(parts) > 1 else "", source="user")
+
+
+@bot.message_handler(commands=["add"])
+def cmd_add(message: types.Message):
+    uid = message.from_user.id
+    add_state[uid] = {"step": "login"}
+    bot.reply_to(
+        message,
+        "➕ Добавление в раздел <b>От пользователей</b>\n\n"
+        "1) Отправь <b>логин</b>\n"
+        "2) Потом <b>пароль</b>\n"
+        "3) Потом <b>игры</b> (текстом)\n"
+        "4) Бот проверит Steam — только рабочий аккаунт попадёт в список\n\n"
+        "Логин не должен быть в основном списке или уже добавлен.\n"
+        "Отмена: /cancel",
+    )
+
+
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message: types.Message):
+    add_state.pop(message.from_user.id, None)
+    pending_captcha.pop(message.from_user.id, None)
+    bot.reply_to(message, "Отменено.")
 
 
 @bot.message_handler(commands=["check"])
@@ -358,25 +512,27 @@ def cmd_check(message: types.Message):
     now = time.time()
     left = int(CHECK_COOLDOWN - (now - last_check.get(uid, 0)))
     if left > 0:
-        bot.reply_to(message, f"⏳ Подожди ещё <b>{left}</b> сек.", parse_mode="HTML")
+        bot.reply_to(message, f"⏳ Подожди ещё <b>{left}</b> сек.")
         return
     last_check[uid] = now
     run_check(message.chat.id, uid, login, password)
 
 
-def do_search(message: types.Message, q: str):
+def do_search(message: types.Message, q: str, source: str = "main"):
     if len(q) < 2:
-        bot.reply_to(message, "Минимум 2 символа. Пример: <code>forza</code>")
+        bot.reply_to(message, "Минимум 2 символа.")
         return
-    found = search_accounts(q)
+    pool = ACCOUNTS if source == "main" else load_user_accounts()
+    found = search_in(pool, q)
     if not found:
         bot.reply_to(message, f"Ничего не найдено: <b>{esc(q)}</b>")
         return
     uid = message.from_user.id
-    user_results[uid] = found
+    set_ctx(uid, found, source)
+    title = "Основной" if source == "main" else "От пользователей"
     bot.reply_to(
         message,
-        f"Найдено: <b>{len(found)}</b>\n✅/❌ — уже проверенные\nВыбери аккаунт:",
+        f"<b>{title}</b> · найдено: <b>{len(found)}</b>\nВыбери аккаунт:",
         reply_markup=page_kb(uid, 0),
     )
 
@@ -385,7 +541,9 @@ def do_search(message: types.Message, q: str):
 def on_callback(cq: types.CallbackQuery):
     data = cq.data or ""
     uid = cq.from_user.id
-    found = user_results.get(uid) or []
+    ctx = get_ctx(uid)
+    found = ctx.get("list") or []
+    source = ctx.get("source") or "main"
 
     if data == "noop":
         bot.answer_callback_query(cq.id)
@@ -421,7 +579,7 @@ def on_callback(cq: types.CallbackQuery):
             bot.answer_callback_query(cq.id, "Сделай поиск снова", show_alert=True)
             return
         a = found[idx]
-        bot.send_message(cq.message.chat.id, fmt_acc(a, idx + 1), reply_markup=acc_kb(idx, page))
+        bot.send_message(cq.message.chat.id, fmt_acc(a, idx + 1, source), reply_markup=acc_kb(idx, page))
         bot.answer_callback_query(cq.id)
         return
 
@@ -452,18 +610,79 @@ def on_callback(cq: types.CallbackQuery):
 def on_text(message: types.Message):
     uid = message.from_user.id
     text = (message.text or "").strip()
+
+    # captcha reply
     if uid in pending_captcha:
         pend = pending_captcha.pop(uid)
-        run_check(
-            message.chat.id,
-            uid,
-            pend.get("login") or "",
-            pend.get("password") or "",
-            pend.get("captcha_gid") or "-1",
-            text,
-        )
+        login = pend.get("login") or ""
+        password = pend.get("password") or ""
+        gid = pend.get("captcha_gid") or "-1"
+        # if this was part of /add
+        st = add_state.get(uid) or {}
+        if st.get("await_captcha_add") or st.get("step") == "checking":
+            def after_ok(l, p):
+                games = st.get("games") or "?"
+                uname = message.from_user.username or message.from_user.first_name or str(uid)
+                finish_add_account(message.chat.id, uid, l, p, games, uname)
+            run_check(message.chat.id, uid, login, password, gid, text, after_ok=after_ok)
+            return
+        run_check(message.chat.id, uid, login, password, gid, text)
         return
-    do_search(message, text)
+
+    # /add wizard
+    st = add_state.get(uid)
+    if st:
+        step = st.get("step")
+        if step == "login":
+            login = text
+            if len(login) < 2:
+                bot.reply_to(message, "Слишком короткий логин. Ещё раз:")
+                return
+            where = login_exists_anywhere(login)
+            if where == "main":
+                bot.reply_to(message, "❌ Уже в основном списке. Другой логин или /cancel")
+                return
+            if where == "user":
+                bot.reply_to(message, "❌ Уже в разделе пользователей. Другой логин или /cancel")
+                return
+            add_state[uid] = {"step": "password", "login": login}
+            bot.reply_to(message, "Теперь отправь <b>пароль</b>:")
+            return
+        if step == "password":
+            add_state[uid] = {"step": "games", "login": st.get("login"), "password": text}
+            bot.reply_to(message, "Теперь отправь список <b>игр</b> на аккаунте:")
+            return
+        if step == "games":
+            login = st.get("login") or ""
+            password = st.get("password") or ""
+            games = text
+            if len(games) < 2:
+                bot.reply_to(message, "Укажи игры текстом. Ещё раз:")
+                return
+            now = time.time()
+            left = int(CHECK_COOLDOWN - (now - last_check.get(uid, 0)))
+            if left > 0:
+                bot.reply_to(message, f"⏳ Подожди {left} сек. перед проверкой, потом снова /add")
+                add_state.pop(uid, None)
+                return
+            last_check[uid] = now
+            add_state[uid] = {
+                "step": "checking",
+                "login": login,
+                "password": password,
+                "games": games,
+            }
+            uname = message.from_user.username or message.from_user.first_name or str(uid)
+
+            def after_ok(l, p):
+                finish_add_account(message.chat.id, uid, l, p, games, uname)
+
+            bot.reply_to(message, "Проверяю аккаунт на Steam перед добавлением...")
+            run_check(message.chat.id, uid, login, password, after_ok=after_ok)
+            return
+
+    # default: search main
+    do_search(message, text, source="main")
 
 
 @app.get("/")
@@ -471,6 +690,7 @@ def health():
     return {
         "ok": True,
         "accounts": len(ACCOUNTS),
+        "user_accounts": len(load_user_accounts()),
         "webhook": bool(WEBHOOK_URL),
         "checked": len(load_status()),
     }, 200
@@ -499,7 +719,7 @@ def setup_webhook():
 
 
 setup_webhook()
-print(f"Web service ready | accounts: {len(ACCOUNTS)} | PORT={PORT}")
+print(f"Ready | main={len(ACCOUNTS)} user={len(load_user_accounts())}")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)

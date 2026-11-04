@@ -1,5 +1,4 @@
 pyTelegramBotAPI==4.23.0
-requests==2.32.3
-pycryptodome==3.21.0
 flask==3.0.3
 gunicorn==23.0.0
+yt-dlp>=2024.8.0

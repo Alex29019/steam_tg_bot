@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import tempfile
 import os
 import secrets as py_secrets
 import threading
@@ -495,9 +497,10 @@ def cmd_start(message: types.Message):
     bot.reply_to(
         message,
         "Список общих Steam-аккаунтов.\n\n"
-        "<b>/accfree</b> — все аккаунты\n"
-        "<b>/accfree forza</b> — поиск по игре\n\n"
-        "Работает в личке и в группах.",
+        "<b>/accfree</b> - все аккаунты\n"
+        "<b>/accfree forza</b> - поиск по игре\n\n"
+        "Работает в личке и в группах.\n\n"
+        "Скинь ссылку TikTok - скачаю видео.",
     )
 
 
@@ -578,10 +581,22 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
     try:
         chat = message.chat
         new = message.new_chat_member
+        old = message.old_chat_member
         status = (new.status if new else "") or ""
+        old_status = (old.status if old else "") or ""
         if status in ("member", "administrator"):
             if chat.type in ("group", "supergroup"):
                 remember_chat(chat.id, chat.type)
+                # только при реальном добавлении, не при смене прав
+                if old_status in ("left", "kicked", ""):
+                    try:
+                        bot.send_message(
+                            chat.id,
+                            "Ура! меня добавили в чат\n"
+                            "Напиши команду /accfree для доступа к базе акков",
+                        )
+                    except Exception as e:
+                        print("welcome msg:", e)
         elif status in ("left", "kicked"):
             forget_chat(chat.id)
     except Exception as e:
@@ -765,13 +780,15 @@ def on_callback(cq: types.CallbackQuery):
         bot.answer_callback_query(cq.id)
         return
 
-    # ---- user buttons cooldown ----
-    if data != "noop":
+    # КД только на выбор аккаунта, листать страницы можно без ожидания
+    if data.startswith("a:"):
         now = time.time()
         prev = last_click.get(uid, 0)
         left = CLICK_COOLDOWN - (now - prev)
         if left > 0:
-            bot.answer_callback_query(cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False)
+            bot.answer_callback_query(
+                cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False
+            )
             return
         last_click[uid] = now
 
@@ -937,6 +954,98 @@ def on_private_text(message: types.Message):
     # обычный текст в личке — подсказка
     if not is_admin(uid):
         bot.reply_to(message, "Команды: /accfree — список аккаунтов.")
+
+
+
+TIKTOK_URL_RE = re.compile(
+    r"https?://(?:(?:www|vm|vt)\.)?tiktok\.com/\S+",
+    re.I,
+)
+
+
+def download_tiktok(url: str) -> tuple[str | None, str | None]:
+    """Скачать видео TikTok. Возвращает (path, error)."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return None, "yt-dlp не установлен на сервере"
+
+    tmpdir = tempfile.mkdtemp(prefix="tt_")
+    outtmpl = str(Path(tmpdir) / "%(id)s.%(ext)s")
+    opts = {
+        "outtmpl": outtmpl,
+        "format": "mp4/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(info)
+            if not Path(path).exists():
+                # иногда расширение другое
+                files = list(Path(tmpdir).glob("*"))
+                files = [f for f in files if f.is_file()]
+                if not files:
+                    return None, "Файл не скачался"
+                path = str(files[0])
+            # лимит Telegram ~50MB для bot API обычный
+            if Path(path).stat().st_size > 49 * 1024 * 1024:
+                return None, "Видео слишком большое для Telegram"
+            return path, None
+    except Exception as e:
+        return None, f"Не удалось скачать: {e}"
+
+
+@bot.message_handler(
+    func=lambda m: bool(m.text) and bool(TIKTOK_URL_RE.search(m.text or "")),
+    content_types=["text"],
+)
+def on_tiktok_link(message: types.Message):
+    m = TIKTOK_URL_RE.search(message.text or "")
+    if not m:
+        return
+    url = m.group(0).rstrip(").,]'\">")
+    if message.chat.type in ("group", "supergroup"):
+        remember_chat(message.chat.id, message.chat.type)
+        remember_user(message.chat.id, message.from_user)
+    wait = bot.reply_to(message, "⏳ Скачиваю TikTok…")
+    path, err = download_tiktok(url)
+    if err or not path:
+        try:
+            bot.edit_message_text(
+                f"❌ {err or 'Ошибка'}",
+                message.chat.id,
+                wait.message_id,
+            )
+        except Exception:
+            bot.reply_to(message, f"❌ {err or 'Ошибка'}")
+        return
+    try:
+        with open(path, "rb") as f:
+            bot.send_video(message.chat.id, f, reply_to_message_id=message.message_id)
+        try:
+            bot.delete_message(message.chat.id, wait.message_id)
+        except Exception:
+            pass
+    except Exception as e:
+        bot.reply_to(message, f"❌ Не отправилось: {e}")
+    finally:
+        try:
+            p = Path(path)
+            for f in p.parent.glob("*"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+            p.parent.rmdir()
+        except Exception:
+            pass
+
 
 
 @app.get("/")

@@ -1,6 +1,7 @@
 """
 Steam accounts list bot for groups.
-Commands: /accfree [игра]
+/accfree [игра]
+Каждые 30 мин — напоминание в добавленные чаты.
 Start: gunicorn -b 0.0.0.0:$PORT bot:app
 Env: BOT_TOKEN, WEBHOOK_URL
 """
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -17,7 +19,15 @@ from telebot import types
 
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
+CHATS_FILE = ROOT / "known_chats.json"
 PAGE_SIZE = 10
+CLICK_COOLDOWN = 5
+REMINDER_INTERVAL = 30 * 60  # 30 минут
+REMINDER_TEXT = (
+    "Напомню!!!\n"
+    "Я бот для поиска аккаунтов, напиши команду /accfree "
+    "что бы получить доступ к 2к+ акков"
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -29,11 +39,51 @@ PORT = int(os.getenv("PORT", "10000"))
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# chat_id:user_id -> {"list": [...], "q": str}
 user_results: dict[str, dict] = {}
 last_click: dict[int, float] = {}
 last_cmd: dict[int, float] = {}
-CLICK_COOLDOWN = 5  # секунд между кликами по кнопкам
+
+
+def load_chats() -> set[int]:
+    try:
+        if CHATS_FILE.exists():
+            data = json.loads(CHATS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {int(x) for x in data}
+    except Exception as e:
+        print("load_chats:", e)
+    return set()
+
+
+def save_chats(chats: set[int]) -> None:
+    try:
+        CHATS_FILE.write_text(
+            json.dumps(sorted(chats), ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print("save_chats:", e)
+
+
+known_chats: set[int] = load_chats()
+
+
+def remember_chat(chat_id: int, chat_type: str | None = None) -> None:
+    """Запомнить группу/супергруппу для рассылки."""
+    if chat_type and chat_type not in ("group", "supergroup"):
+        return
+    if chat_id in known_chats:
+        return
+    known_chats.add(chat_id)
+    save_chats(known_chats)
+    print(f"remember chat {chat_id}, total={len(known_chats)}")
+
+
+def forget_chat(chat_id: int) -> None:
+    if chat_id in known_chats:
+        known_chats.discard(chat_id)
+        save_chats(known_chats)
+        print(f"forget chat {chat_id}")
 
 
 def ctx_key(chat_id: int, user_id: int) -> str:
@@ -68,7 +118,11 @@ def page_kb(key: str, page: int) -> types.InlineKeyboardMarkup:
         idx = start + i
         games = a.get("g") or a.get("l") or "?"
         short = games if len(games) <= 40 else games[:37] + "..."
-        kb.add(types.InlineKeyboardButton(f"{idx + 1}. {short}", callback_data=f"a:{idx}:{page}"))
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{idx + 1}. {short}", callback_data=f"a:{idx}:{page}"
+            )
+        )
     nav = []
     if page > 0:
         nav.append(types.InlineKeyboardButton("←", callback_data=f"p:{page - 1}"))
@@ -89,7 +143,18 @@ def fmt_acc(a: dict, n: int | None = None) -> str:
     )
 
 
-def show_menu(chat_id: int, user_id: int, query: str | None, reply_to: types.Message | None = None):
+def show_menu(
+    chat_id: int,
+    user_id: int,
+    query: str | None,
+    reply_to: types.Message | None = None,
+    chat_type: str | None = None,
+):
+    if chat_type:
+        remember_chat(chat_id, chat_type)
+    elif chat_id < 0:
+        remember_chat(chat_id, "supergroup")
+
     found = search_accounts(query)
     key = ctx_key(chat_id, user_id)
     user_results[key] = {"list": found, "q": (query or "").strip()}
@@ -104,8 +169,10 @@ def show_menu(chat_id: int, user_id: int, query: str | None, reply_to: types.Mes
     title = (
         f"📂 <b>Бесплатные аккаунты</b>\nНайдено: <b>{len(found)}</b> по «{esc(q)}»"
         if q
-        else f"📂 <b>Бесплатные аккаунты</b>\nВсего: <b>{len(found)}</b>\n"
-        f"Поиск: <code>/accfree название игры</code>"
+        else (
+            f"📂 <b>Бесплатные аккаунты</b>\nВсего: <b>{len(found)}</b>\n"
+            f"Поиск: <code>/accfree название игры</code>"
+        )
     )
     kb = page_kb(key, 0)
     if reply_to:
@@ -114,8 +181,43 @@ def show_menu(chat_id: int, user_id: int, query: str | None, reply_to: types.Mes
         bot.send_message(chat_id, title, reply_markup=kb)
 
 
+def send_reminders() -> None:
+    chats = list(load_chats())
+    print(f"reminder tick, chats={len(chats)}")
+    for cid in chats:
+        try:
+            bot.send_message(cid, REMINDER_TEXT)
+            time.sleep(0.05)
+        except Exception as e:
+            err = str(e).lower()
+            print(f"reminder fail {cid}: {e}")
+            if any(
+                x in err
+                for x in (
+                    "blocked",
+                    "kicked",
+                    "deactivated",
+                    "chat not found",
+                    "forbidden",
+                    "have no rights",
+                )
+            ):
+                forget_chat(cid)
+
+
+def reminder_loop() -> None:
+    # первая пауза 30 мин после старта, потом каждые 30 мин
+    while True:
+        time.sleep(REMINDER_INTERVAL)
+        try:
+            send_reminders()
+        except Exception as e:
+            print("reminder_loop error:", e)
+
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message):
+    remember_chat(message.chat.id, message.chat.type)
     bot.reply_to(
         message,
         "Список общих Steam-аккаунтов.\n\n"
@@ -134,11 +236,33 @@ def cmd_accfree(message: types.Message):
         bot.reply_to(message, f"⏳ Подожди ещё <b>{int(left) + 1}</b> сек.")
         return
     last_cmd[uid] = now
-    # /accfree or /accfree@BotName [query]
     raw = message.text or ""
     parts = raw.split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
-    show_menu(message.chat.id, uid, query or None, reply_to=message)
+    show_menu(
+        message.chat.id,
+        uid,
+        query or None,
+        reply_to=message,
+        chat_type=message.chat.type,
+    )
+
+
+@bot.my_chat_member_handler()
+def on_my_chat_member(message: types.ChatMemberUpdated):
+    """Когда бота добавили / кикнули из чата."""
+    try:
+        chat = message.chat
+        new = message.new_chat_member
+        status = (new.status if new else "") or ""
+        if status in ("member", "administrator"):
+            remember_chat(chat.id, chat.type)
+            print(f"bot added to {chat.id} ({chat.type})")
+        elif status in ("left", "kicked"):
+            forget_chat(chat.id)
+            print(f"bot removed from {chat.id}")
+    except Exception as e:
+        print("my_chat_member error:", e)
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -147,24 +271,23 @@ def on_callback(cq: types.CallbackQuery):
     uid = cq.from_user.id
     chat_id = cq.message.chat.id if cq.message else 0
 
-    # антиспам кнопок: 5 сек тишины
     if data != "noop":
         now = time.time()
         prev = last_click.get(uid, 0)
         left = CLICK_COOLDOWN - (now - prev)
         if left > 0:
             bot.answer_callback_query(
-                cq.id,
-                f"Подожди {int(left) + 1} сек.",
-                show_alert=False,
+                cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False
             )
             return
         last_click[uid] = now
+
+    if cq.message:
+        remember_chat(chat_id, cq.message.chat.type)
+
     key = ctx_key(chat_id, uid)
-    # fallback: any key for this user in this chat prefix
     found_data = user_results.get(key)
     if not found_data:
-        # try match any list for this user (group: menu opened by same user)
         for k, v in user_results.items():
             if k.endswith(f":{uid}"):
                 found_data = v
@@ -214,7 +337,12 @@ def on_callback(cq: types.CallbackQuery):
 
 @app.get("/")
 def health():
-    return {"ok": True, "accounts": len(ACCOUNTS), "webhook": bool(WEBHOOK_URL)}, 200
+    return {
+        "ok": True,
+        "accounts": len(ACCOUNTS),
+        "chats": len(known_chats),
+        "webhook": bool(WEBHOOK_URL),
+    }, 200
 
 
 @app.post("/webhook")
@@ -240,7 +368,12 @@ def setup_webhook():
 
 
 setup_webhook()
-print(f"Ready | accounts={len(ACCOUNTS)}")
+
+# фоновый поток напоминаний
+_t = threading.Thread(target=reminder_loop, name="reminder", daemon=True)
+_t.start()
+
+print(f"Ready | accounts={len(ACCOUNTS)} | known_chats={len(known_chats)}")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)

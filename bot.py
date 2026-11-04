@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import telebot
@@ -30,6 +31,9 @@ app = Flask(__name__)
 
 # chat_id:user_id -> {"list": [...], "q": str}
 user_results: dict[str, dict] = {}
+last_click: dict[int, float] = {}
+last_cmd: dict[int, float] = {}
+CLICK_COOLDOWN = 5  # секунд между кликами по кнопкам
 
 
 def ctx_key(chat_id: int, user_id: int) -> str:
@@ -123,12 +127,18 @@ def cmd_start(message: types.Message):
 
 @bot.message_handler(commands=["accfree"])
 def cmd_accfree(message: types.Message):
+    uid = message.from_user.id
+    now = time.time()
+    left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
+    if left > 0:
+        bot.reply_to(message, f"⏳ Подожди ещё <b>{int(left) + 1}</b> сек.")
+        return
+    last_cmd[uid] = now
     # /accfree or /accfree@BotName [query]
-    text = message.text or ""
-    parts = text.split(maxsplit=1)
+    raw = message.text or ""
+    parts = raw.split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
-    # strip @botname from first token already handled by split
-    show_menu(message.chat.id, message.from_user.id, query or None, reply_to=message)
+    show_menu(message.chat.id, uid, query or None, reply_to=message)
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -136,6 +146,20 @@ def on_callback(cq: types.CallbackQuery):
     data = cq.data or ""
     uid = cq.from_user.id
     chat_id = cq.message.chat.id if cq.message else 0
+
+    # антиспам кнопок: 5 сек тишины
+    if data != "noop":
+        now = time.time()
+        prev = last_click.get(uid, 0)
+        left = CLICK_COOLDOWN - (now - prev)
+        if left > 0:
+            bot.answer_callback_query(
+                cq.id,
+                f"Подожди {int(left) + 1} сек.",
+                show_alert=False,
+            )
+            return
+        last_click[uid] = now
     key = ctx_key(chat_id, uid)
     # fallback: any key for this user in this chat prefix
     found_data = user_results.get(key)

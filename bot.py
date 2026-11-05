@@ -525,57 +525,6 @@ def cmd_accfree(message: types.Message):
 
 
 
-
-@bot.message_handler(
-    func=lambda m: bool(m.text)
-    and (m.text or "").strip().lower().startswith((".каталог", ".поиск", ".catalog", ".search"))
-)
-def cmd_dot_automation(message: types.Message):
-    """Автоматизация чатов: .каталог | .поиск <игра>"""
-    uid = message.from_user.id if message.from_user else 0
-    now = time.time()
-    left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
-    if left > 0:
-        bot.reply_to(message, f"⏳ Подожди ещё <b>{int(left) + 1}</b> сек.")
-        return
-    last_cmd[uid] = now
-
-    if message.chat.type in ("group", "supergroup"):
-        remember_chat(message.chat.id, message.chat.type)
-        remember_user(message.chat.id, message.from_user)
-
-    raw = (message.text or "").strip()
-    # убрать возможный @bot в конце первой "команды" не нужно для точки
-    low = raw.lower()
-    if low.startswith(".каталог") or low.startswith(".catalog"):
-        show_menu(
-            message.chat.id,
-            uid,
-            None,
-            reply_to=message,
-            chat_type=message.chat.type,
-        )
-        return
-
-    # .поиск / .search
-    parts = raw.split(maxsplit=1)
-    query = parts[1].strip() if len(parts) > 1 else ""
-    if len(query) < 2:
-        bot.reply_to(
-            message,
-            "Формат: <code>.поиск название игры</code>\n"
-            "Пример: <code>.поиск forza</code>",
-        )
-        return
-    show_menu(
-        message.chat.id,
-        uid,
-        query,
-        reply_to=message,
-        chat_type=message.chat.type,
-    )
-
-
 @bot.message_handler(commands=["auth"])
 def cmd_auth(message: types.Message):
     if message.chat.type != "private":

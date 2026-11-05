@@ -600,6 +600,75 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
         print("my_chat_member:", e)
 
 
+
+@bot.inline_handler(lambda query: True)
+def on_inline_query(query: types.InlineQuery):
+    """Инлайн: @bot_username forza — список аккаунтов."""
+    qtext = (query.query or "").strip()
+    uid = query.from_user.id if query.from_user else 0
+
+    # лёгкий кд на инлайн (антиспам)
+    now = time.time()
+    prev = last_cmd.get(uid, 0)
+    # не блокируем полностью — просто не чаще чем раз в 1 сек обновлять тяжело
+    results = []
+    found = search_accounts(qtext if len(qtext) >= 2 else None)
+    # без запроса — топ/случайная выборка чтобы не слать все 2к
+    if len(qtext) < 2:
+        found = found[:20]
+    else:
+        found = found[:30]
+
+    for i, a in enumerate(found):
+        login = a.get("l") or "?"
+        password = a.get("p") or "?"
+        games = a.get("g") or "—"
+        title = (games[:60] + "…") if len(games) > 60 else games
+        desc = f"{login}"
+        body = (
+            f"🎮 <b>{esc(games)}</b>\n\n"
+            f"👤 Логин:\n<code>{esc(login)}</code>\n\n"
+            f"🔑 Пароль:\n<code>{esc(password)}</code>"
+        )
+        # id must be unique string 1-64 bytes
+        rid = f"{i}_{hash(login) % 10_000_000}"
+        results.append(
+            types.InlineQueryResultArticle(
+                id=rid[:60],
+                title=title or f"Аккаунт {i+1}",
+                description=desc,
+                input_message_content=types.InputTextMessageContent(
+                    body,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                ),
+            )
+        )
+
+    if not results:
+        results.append(
+            types.InlineQueryResultArticle(
+                id="empty",
+                title="Ничего не найдено",
+                description="Попробуй другое название игры",
+                input_message_content=types.InputTextMessageContent(
+                    f"По запросу «{esc(qtext)}» ничего не найдено.",
+                    parse_mode="HTML",
+                ),
+            )
+        )
+
+    try:
+        bot.answer_inline_query(
+            query.id,
+            results,
+            cache_time=5,
+            is_personal=True,
+        )
+    except Exception as e:
+        print("inline error:", e)
+
+
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(cq: types.CallbackQuery):
     data = cq.data or ""

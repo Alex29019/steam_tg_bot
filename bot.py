@@ -1443,18 +1443,60 @@ def on_callback(cq: types.CallbackQuery):
                 bot.send_message(chat_id, "Заявок пока нет.")
                 return
             lines = []
-            for i, r in enumerate(items[:30]):
-                un = r.get("username") or r.get("uid") or "?"
-                lines.append(
-                    f"{i+1}. <b>{esc(r.get('game'))}</b> — @{esc(un)} · {esc(r.get('at') or '')}"
-                )
-            more = f"\n… ещё {len(items)-30}" if len(items) > 30 else ""
             kb = types.InlineKeyboardMarkup()
+            for i, r in enumerate(items[:20]):
+                un = r.get("username") or r.get("uid") or "?"
+                game = r.get("game") or "?"
+                short = game if len(game) <= 24 else game[:21] + "..."
+                lines.append(
+                    f"{i+1}. <b>{esc(game)}</b> — @{esc(str(un))} · {esc(r.get('at') or '')}"
+                )
+                kb.add(
+                    types.InlineKeyboardButton(
+                        f"📤 {i+1}. {short}",
+                        callback_data=f"adm:reqsend:{i}",
+                    )
+                )
+            more = f"\n… ещё {len(items)-20}" if len(items) > 20 else ""
             kb.add(types.InlineKeyboardButton("🗑 Очистить заявки", callback_data="adm:reqclear"))
             bot.send_message(
                 chat_id,
-                f"🎮 Заявки: <b>{len(items)}</b>\n\n" + "\n".join(lines) + more,
+                f"🎮 Заявки: <b>{len(items)}</b>\n"
+                f"Нажми 📤 чтобы отправить акк человеку в личку.\n\n"
+                + "\n".join(lines) + more,
                 reply_markup=kb,
+            )
+            return
+
+        if action.startswith("reqsend:"):
+            try:
+                idx = int(action.split(":")[1])
+            except Exception:
+                bot.answer_callback_query(cq.id, "Ошибка", show_alert=True)
+                return
+            items = load_requests()
+            if idx < 0 or idx >= len(items):
+                bot.answer_callback_query(cq.id, "Заявка устарела", show_alert=True)
+                return
+            r = items[idx]
+            target = int(r.get("uid") or 0)
+            game = r.get("game") or ""
+            uname = r.get("username") or str(target)
+            if not target:
+                bot.answer_callback_query(cq.id, "Нет uid", show_alert=True)
+                return
+            admin_wait[uid] = f"req_acc:{target}:{idx}:{game}"
+            bot.answer_callback_query(cq.id)
+            bot.send_message(
+                chat_id,
+                f"📤 Заявка: <b>{esc(game)}</b>\n"
+                f"Кому: @{esc(str(uname))} (<code>{target}</code>)\n\n"
+                f"Пришли аккаунт <b>одним сообщением</b> в формате:\n"
+                f"<code>логин:пароль</code>\n"
+                f"или\n"
+                f"<code>логин:пароль:игры</code>\n\n"
+                f"Человек получит это в личку с ботом.\n"
+                f"Отмена: /cancel",
             )
             return
 
@@ -1729,6 +1771,59 @@ def on_private_text(message: types.Message):
             )
             return
 
+        if step.startswith("req_acc:"):
+            # req_acc:target_uid:idx:game
+            parts = step.split(":", 3)
+            try:
+                target = int(parts[1])
+                idx = int(parts[2])
+                game = parts[3] if len(parts) > 3 else ""
+            except Exception:
+                bot.reply_to(message, "Ошибка заявки, начни снова.")
+                return
+            body = text.strip()
+            if not body or ":" not in body:
+                bot.reply_to(
+                    message,
+                    "Формат: <code>логин:пароль</code> или <code>логин:пароль:игры</code>",
+                )
+                admin_wait[uid] = step
+                return
+            bits = body.split(":", 2)
+            login = bits[0].strip()
+            password = bits[1].strip() if len(bits) > 1 else ""
+            games = bits[2].strip() if len(bits) > 2 else game
+            if not login or not password:
+                bot.reply_to(message, "Нужны логин и пароль.")
+                admin_wait[uid] = step
+                return
+            dm = (
+                f"✅ <b>Ответ на заявку</b>\n"
+                f"Игра: <b>{esc(games or game or '—')}</b>\n\n"
+                f"👤 Логин:\n<code>{esc(login)}</code>\n\n"
+                f"🔑 Пароль:\n<code>{esc(password)}</code>\n\n"
+                f"Если не подойдёт — напиши новую /заявка"
+            )
+            try:
+                bot.send_message(target, dm, parse_mode="HTML")
+            except Exception as e:
+                bot.reply_to(
+                    message,
+                    f"❌ Не удалось написать в личку (пользователь не запускал бота "
+                    f"или заблокировал):\n{esc(str(e))}",
+                )
+                return
+            # убрать заявку из списка
+            items = load_requests()
+            if 0 <= idx < len(items) and int(items[idx].get("uid") or 0) == target:
+                items.pop(idx)
+                save_requests(items)
+            bot.reply_to(
+                message,
+                f"✅ Аккаунт отправлен @{esc(str(target))} в личку.\n"
+                f"Заявка закрыта.",
+            )
+            return
         if step == "ban_user":
             target, uname, err = resolve_username(text)
             if err or target is None:

@@ -21,12 +21,22 @@ from telebot import types
 
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
-CHATS_FILE = ROOT / "known_chats.json"
-USERS_FILE = ROOT / "chat_users.json"  # chat_id -> [{id, name}, ...]
-USERS_INDEX_FILE = ROOT / "users_index.json"  # username_lower -> {id, username, name}
-SETTINGS_FILE = ROOT / "bot_settings.json"
-SESSIONS_FILE = ROOT / "admin_sessions.json"
-BANS_FILE = ROOT / "banned_users.json"  # uid -> {reason, at, by}
+# Постоянные данные: на Render укажи DATA_DIR=/data и Persistent Disk,
+# иначе при рестарте баны/сессии/чаты пропадут (эфемерный диск).
+DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT))).resolve()
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    print("DATA_DIR mkdir:", e)
+    DATA_DIR = ROOT
+
+CHATS_FILE = DATA_DIR / "known_chats.json"
+USERS_FILE = DATA_DIR / "chat_users.json"
+USERS_INDEX_FILE = DATA_DIR / "users_index.json"
+SETTINGS_FILE = DATA_DIR / "bot_settings.json"
+SESSIONS_FILE = DATA_DIR / "admin_sessions.json"
+BANS_FILE = DATA_DIR / "banned_users.json"
+print(f"DATA_DIR={DATA_DIR}")
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
 
@@ -123,6 +133,9 @@ def save_admin_sessions() -> None:
 admin_sessions.clear()
 admin_sessions.update(load_admin_sessions())
 print("admin sessions:", len(admin_sessions), "secret_set:", bool(_ADMIN_SECRET))
+print("bans loaded:", len(load_json(BANS_FILE, {})))
+if not _ADMIN_IDS:
+    print("WARN: set ADMIN_IDS in Env so admin access survives restarts")
 
 
 def load_chats() -> set[int]:
@@ -631,7 +644,8 @@ def admin_panel_text() -> str:
         f"Интервал: <b>{int(s.get('reminder_interval_min') or 30)}</b> мин\n\n"
         "1) Выбери чаты\n"
         "2) Рассылка или авто-текст\n"
-        "Если чата нет в списке — напиши /accfree в той группе."
+        "Если чата нет в списке — напиши /accfree в той группе.\n\n"
+        "⚠️ Без Persistent Disk на Render баны сбрасываются после рестарта."
     )
 
 

@@ -25,13 +25,11 @@ CHATS_FILE = ROOT / "known_chats.json"
 USERS_FILE = ROOT / "chat_users.json"
 SETTINGS_FILE = ROOT / "bot_settings.json"
 SESSIONS_FILE = ROOT / "admin_sessions.json"
-STATE_FILE = ROOT / "bot_state.json"  # <-- НОВОЕ: единый файл состояния
 
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
 
 _ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
-
 _ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -48,19 +46,20 @@ PORT = int(os.getenv("PORT", "10000"))
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# Runtime state (теперь персистентный)
 user_results: dict[str, dict] = {}
 last_click: dict[int, float] = {}
 last_cmd: dict[int, float] = {}
 
 admin_sessions: set[int] = set()
 admin_wait: dict[int, str] = {}
-admin_selected: dict[int, list[int]] = {}  # set не сериализуется — используем list
-
+admin_selected: dict[int, set[int]] = {}
 chat_title_cache: dict[int, str] = {}
 
+# Флаг последнего пробуждения webhook
+_last_wake: float = 0.0
 
-# ===== ПЕРСИСТЕНТНОСТЬ =====
+
+# ===== УТИЛИТЫ =====
 
 def load_json(path: Path, default):
     try:
@@ -78,67 +77,13 @@ def save_json(path: Path, data) -> None:
         print("save_json", path, e)
 
 
-def save_state() -> None:
-    """Сохраняет всё runtime-состояние в один файл."""
-    try:
-        state = {
-            "user_results": {k: v for k, v in user_results.items()},
-            "last_click": {str(k): v for k, v in last_click.items()},
-            "last_cmd": {str(k): v for k, v in last_cmd.items()},
-            "admin_wait": {str(k): v for k, v in admin_wait.items()},
-            "admin_selected": {str(k): list(v) for k, v in admin_selected.items()},
-            "admin_sessions": sorted(admin_sessions),
-        }
-        save_json(STATE_FILE, state)
-    except Exception as e:
-        print("save_state error:", e)
-
-
-def load_state() -> None:
-    """Восстанавливает состояние из файла при старте."""
-    global user_results, last_click, last_cmd, admin_wait, admin_selected, admin_sessions
-    try:
-        state = load_json(STATE_FILE, {})
-        if not isinstance(state, dict):
-            return
-
-        user_results = state.get("user_results", {}) or {}
-
-        last_click = {int(k): float(v) for k, v in (state.get("last_click") or {}).items()}
-        last_cmd = {int(k): float(v) for k, v in (state.get("last_cmd") or {}).items()}
-
-        # Очищаем устаревшие КД (старше 5 минут) — чтобы не блокировать пользователей после рестарта
-        now = time.time()
-        last_click = {k: v for k, v in last_click.items() if now - v < 300}
-        last_cmd = {k: v for k, v in last_cmd.items() if now - v < 300}
-
-        admin_wait = {int(k): v for k, v in (state.get("admin_wait") or {}).items()}
-        admin_selected = {int(k): set(v) for k, v in (state.get("admin_selected") or {}).items()}
-        admin_sessions = set(state.get("admin_sessions", []) or [])
-
-        print(f"State restored: sessions={len(admin_sessions)}, wait={len(admin_wait)}, selected={len(admin_selected)}")
-    except Exception as e:
-        print("load_state error:", e)
-
-
-def state_saver_loop() -> None:
-    """Фоновый поток: сохраняет состояние каждые 30 секунд."""
-    while True:
-        try:
-            save_state()
-        except Exception as e:
-            print("state_saver_loop error:", e)
-        time.sleep(30)
-
-
-# ===== НАСТРОЙКИ =====
-
 def load_settings() -> dict:
     s = load_json(SETTINGS_FILE, {})
     if not isinstance(s, dict):
         s = {}
     s.setdefault("reminder_interval_min", 30)
     s.setdefault("reminders_enabled", True)
+    s.setdefault("bot_enabled", True)  # <-- НОВОЕ: флаг вкл/выкл бота
     s.setdefault(
         "reminder_text",
         "Напомню!!!\n"
@@ -155,7 +100,24 @@ def save_settings(s: dict) -> None:
 settings = load_settings()
 
 
-# ===== ЧАТЫ / ПОЛЬЗОВАТЕЛИ =====
+def load_admin_sessions() -> set[int]:
+    data = load_json(SESSIONS_FILE, [])
+    out: set[int] = set()
+    if isinstance(data, list):
+        for x in data:
+            try:
+                out.add(int(x))
+            except Exception:
+                pass
+    return out
+
+
+def save_admin_sessions() -> None:
+    save_json(SESSIONS_FILE, sorted(admin_sessions))
+    admin_sessions.clear()
+    admin_sessions.update(load_admin_sessions())
+    print("admin sessions:", len(admin_sessions), "secret_set:", bool(_ADMIN_SECRET))
+
 
 def load_chats() -> set[int]:
     data = load_json(CHATS_FILE, [])
@@ -260,12 +222,13 @@ def forget_chat(chat_id: int) -> None:
         save_chats(known_chats)
 
 
-# ===== АДМИН =====
-
 def is_admin(uid: int) -> bool:
     if uid in _ADMIN_IDS:
         return True
     if uid in admin_sessions:
+        return True
+    if uid in load_admin_sessions():
+        admin_sessions.add(uid)
         return True
     return False
 
@@ -421,12 +384,14 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     s = load_settings()
     mins = int(s.get("reminder_interval_min") or 30)
     on = "вкл" if s.get("reminders_enabled", True) else "выкл"
+    bot_on = "🟢 ВКЛ" if s.get("bot_enabled", True) else "🔴 ВЫКЛ"  # <-- НОВОЕ
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("🎯 Выбрать чаты", callback_data="adm:pick"))
     kb.add(types.InlineKeyboardButton("📣 Рассылка в выбранные", callback_data="adm:broadcast"))
     kb.add(types.InlineKeyboardButton(f"⏱ КД авто: {mins} мин", callback_data="adm:interval"))
     kb.add(types.InlineKeyboardButton("✏️ Текст авто-сообщений", callback_data="adm:text"))
     kb.add(types.InlineKeyboardButton(f"🔔 Авто: {on}", callback_data="adm:toggle"))
+    kb.add(types.InlineKeyboardButton(f"⚡ Бот: {bot_on}", callback_data="adm:toggle_bot"))  # <-- НОВОЕ
     kb.add(types.InlineKeyboardButton("📤 Авто-текст в выбранные", callback_data="adm:test"))
     kb.add(types.InlineKeyboardButton("👥 Отметить людей", callback_data="adm:mention"))
     kb.add(types.InlineKeyboardButton("🚪 Выйти", callback_data="adm:logout"))
@@ -436,13 +401,16 @@ def admin_kb() -> types.InlineKeyboardMarkup:
 def admin_panel_text() -> str:
     s = load_settings()
     chats = load_chats()
+    bot_on = "🟢 <b>ВКЛЮЧЁН</b>" if s.get("bot_enabled", True) else "🔴 <b>ВЫКЛЮЧЕН</b>"
     return (
         "🛠 <b>Админ-панель</b>\n\n"
         f"Чатов в базе: <b>{len(chats)}</b>\n"
+        f"Статус бота: {bot_on}\n"
         f"Авто-сообщения: <b>{'вкл' if s.get('reminders_enabled', True) else 'выкл'}</b>\n"
         f"Интервал: <b>{int(s.get('reminder_interval_min') or 30)}</b> мин\n\n"
         "1) Выбери чаты\n"
         "2) Рассылка или авто-текст\n"
+        "3) Экстренно выключить бота (⚡)\n"
         "Если чата нет в списке — напиши /accfree в той группе."
     )
 
@@ -452,10 +420,13 @@ def send_reminders(manual: bool = False, only: set[int] | None = None) -> tuple[
     if not manual and not s.get("reminders_enabled", True):
         print("reminders disabled, skip")
         return 0, 0
+    # Если бот выключен — не шлём авто-сообщения
+    if not manual and not s.get("bot_enabled", True):
+        print("bot disabled, skip reminders")
+        return 0, 0
     text = s.get("reminder_text") or "Напомню!!! /accfree "
     chats = list(only) if only is not None else list(load_chats())
-    ok = 0
-    fail = 0
+    ok = fail = 0
     for cid in chats:
         try:
             bot.send_message(cid, text)
@@ -465,17 +436,7 @@ def send_reminders(manual: bool = False, only: set[int] | None = None) -> tuple[
             fail += 1
             err = str(e).lower()
             print(f"reminder fail {cid}: {e}")
-            if any(
-                x in err
-                for x in (
-                    "blocked",
-                    "kicked",
-                    "deactivated",
-                    "chat not found",
-                    "forbidden",
-                    "have no rights",
-                )
-            ):
+            if any(x in err for x in ("blocked", "kicked", "deactivated", "chat not found", "forbidden", "have no rights")):
                 forget_chat(cid)
     return ok, fail
 
@@ -507,10 +468,19 @@ def broadcast(text: str, only: set[int] | None = None) -> tuple[int, int]:
     return ok, fail
 
 
+def is_bot_enabled() -> bool:
+    """Проверяет, включен ли бот. Админы всегда проходят."""
+    return load_settings().get("bot_enabled", True)
+
+
 # ===== КОМАНДЫ =====
 
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message):
+    # Админы проходят всегда
+    if not is_admin(message.from_user.id) and not is_bot_enabled():
+        bot.reply_to(message, "⚠️ Бот временно отключён администратором. Попробуйте позже.")
+        return
     if message.chat.type in ("group", "supergroup"):
         remember_chat(message.chat.id, message.chat.type)
         remember_user(message.chat.id, message.from_user)
@@ -525,6 +495,9 @@ def cmd_start(message: types.Message):
 
 @bot.message_handler(commands=["accfree"])
 def cmd_accfree(message: types.Message):
+    if not is_admin(message.from_user.id) and not is_bot_enabled():
+        bot.reply_to(message, "⚠️ Бот временно отключён администратором.")
+        return
     uid = message.from_user.id
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -557,22 +530,16 @@ def cmd_auth(message: types.Message):
         bot.reply_to(message, "Напиши: <code>/auth секрет</code>")
         return
     if not _ADMIN_SECRET:
-        bot.reply_to(
-            message,
-            "На сервере пустой <b>ADMIN_SECRET</b>. Добавь в Render → Environment.",
-        )
+        bot.reply_to(message, "На сервере пустой <b>ADMIN_SECRET</b>.")
         return
     if secret_ok(parts[1]):
         admin_sessions.add(uid)
-        save_state()  # <-- сохраняем сразу
+        save_admin_sessions()
         try:
             bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
-        bot.send_message(
-            message.chat.id,
-            "✅ Доступ открыт.\nДальше: /admin",
-        )
+        bot.send_message(message.chat.id, "✅ Доступ открыт.\nДальше: /admin")
     else:
         bot.reply_to(message, "Нет доступа.")
 
@@ -584,12 +551,15 @@ def cmd_admin(message: types.Message):
         return
     uid = message.from_user.id
     if not is_admin(uid):
-        bot.reply_to(
-            message,
-            "Нет доступа.\nВ личке: <code>/auth ваш_секрет</code>",
-        )
+        bot.reply_to(message, "Нет доступа.\nВ личке: <code>/auth ваш_секрет</code>")
         return
     bot.reply_to(message, admin_panel_text(), reply_markup=admin_kb())
+
+
+@bot.message_handler(commands=["wake", "ping"])
+def cmd_wake(message: types.Message):
+    """Команда для принудительного пробуждения бота."""
+    bot.reply_to(message, f"✅ Бот активен!\nВремя: <code>{time.strftime('%H:%M:%S')}</code>")
 
 
 @bot.message_handler(commands=["cancel"])
@@ -626,6 +596,22 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
 
 @bot.inline_handler(lambda query: True)
 def on_inline_query(query: types.InlineQuery):
+    if not is_bot_enabled():
+        try:
+            bot.answer_inline_query(
+                query.id,
+                [types.InlineQueryResultArticle(
+                    id="off",
+                    title="⚠️ Бот временно отключён",
+                    description="Попробуйте позже",
+                    input_message_content=types.InputTextMessageContent("⚠️ Бот временно отключён администратором."),
+                )],
+                cache_time=60,
+            )
+        except Exception:
+            pass
+        return
+
     qtext = (query.query or "").strip()
     uid = query.from_user.id if query.from_user else 0
     results = []
@@ -671,12 +657,7 @@ def on_inline_query(query: types.InlineQuery):
             )
         )
     try:
-        bot.answer_inline_query(
-            query.id,
-            results,
-            cache_time=5,
-            is_personal=True,
-        )
+        bot.answer_inline_query(query.id, results, cache_time=5, is_personal=True)
     except Exception as e:
         print("inline error:", e)
 
@@ -694,11 +675,26 @@ def on_callback(cq: types.CallbackQuery):
             return
         action = data.split(":", 1)[1]
 
+        # <-- НОВОЕ: вкл/выкл бота
+        if action == "toggle_bot":
+            s = load_settings()
+            s["bot_enabled"] = not s.get("bot_enabled", True)
+            save_settings(s)
+            state = "🟢 ВКЛЮЧЁН" if s["bot_enabled"] else "🔴 ВЫКЛЮЧЕН"
+            bot.answer_callback_query(cq.id, f"Бот {state}", show_alert=True)
+            try:
+                bot.edit_message_text(
+                    admin_panel_text(), chat_id, cq.message.message_id, reply_markup=admin_kb()
+                )
+            except Exception:
+                bot.send_message(chat_id, admin_panel_text(), reply_markup=admin_kb())
+            print(f"[ADMIN] uid={uid} toggled bot_enabled={s['bot_enabled']}")
+            return
+
         if action == "logout":
             admin_sessions.discard(uid)
+            save_admin_sessions()
             admin_wait.pop(uid, None)
-            admin_selected.pop(uid, None)
-            save_state()  # <-- сохраняем сразу
             bot.answer_callback_query(cq.id, "Вышел")
             try:
                 bot.edit_message_text("Сессия админа закрыта.", chat_id, cq.message.message_id)
@@ -722,10 +718,7 @@ def on_callback(cq: types.CallbackQuery):
             admin_selected.setdefault(uid, set())
             try:
                 bot.edit_message_text(
-                    selection_text(uid),
-                    chat_id,
-                    cq.message.message_id,
-                    reply_markup=selection_kb(uid),
+                    selection_text(uid), chat_id, cq.message.message_id, reply_markup=selection_kb(uid)
                 )
             except Exception:
                 bot.send_message(chat_id, selection_text(uid), reply_markup=selection_kb(uid))
@@ -801,16 +794,14 @@ def on_callback(cq: types.CallbackQuery):
             bot.answer_callback_query(cq.id)
             bot.send_message(
                 chat_id,
-                "Пришли <b>новый текст</b> напоминания одним сообщением.\nОтмена: /cancel",
+                "Пришли <b>текст</b> напоминания одним сообщением.\nОтмена: /cancel",
             )
             return
 
         if action == "mention":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(
-                    cq.id, "Сначала выбери чаты", show_alert=True
-                )
+                bot.answer_callback_query(cq.id, "Сначала выбери чаты", show_alert=True)
                 return
             admin_wait[uid] = "mention_count"
             bot.answer_callback_query(cq.id)
@@ -828,9 +819,7 @@ def on_callback(cq: types.CallbackQuery):
         if action == "broadcast":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(
-                    cq.id, "Сначала выбери чаты (🎯 Выбрать чаты)", show_alert=True
-                )
+                bot.answer_callback_query(cq.id, "Сначала выбери чаты (🎯 Выбрать чаты)", show_alert=True)
                 return
             admin_wait[uid] = "broadcast"
             bot.answer_callback_query(cq.id)
@@ -844,9 +833,7 @@ def on_callback(cq: types.CallbackQuery):
         if action == "test":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(
-                    cq.id, "Сначала выбери чаты (🎯)", show_alert=True
-                )
+                bot.answer_callback_query(cq.id, "Сначала выбери чаты (🎯)", show_alert=True)
                 return
             bot.answer_callback_query(cq.id, "Шлю…")
             ok, fail = send_reminders(manual=True, only=sel)
@@ -856,15 +843,18 @@ def on_callback(cq: types.CallbackQuery):
         bot.answer_callback_query(cq.id)
         return
 
+    # Проверка: если бот выключен, обычные пользователи не могут жать кнопки
+    if not is_admin(uid) and not is_bot_enabled():
+        bot.answer_callback_query(cq.id, "⚠️ Бот временно отключён", show_alert=True)
+        return
+
     # КД только на выбор аккаунта
     if data.startswith("a:"):
         now = time.time()
         prev = last_click.get(uid, 0)
         left = CLICK_COOLDOWN - (now - prev)
         if left > 0:
-            bot.answer_callback_query(
-                cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False
-            )
+            bot.answer_callback_query(cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False)
             return
         last_click[uid] = now
 
@@ -932,7 +922,7 @@ def on_private_text(message: types.Message):
     # ввод секрета
     if not is_admin(uid) and secret_ok(text):
         admin_sessions.add(uid)
-        save_state()
+        save_admin_sessions()
         try:
             bot.delete_message(message.chat.id, message.message_id)
         except Exception:
@@ -944,7 +934,7 @@ def on_private_text(message: types.Message):
         )
         return
 
-    # шаги админки
+    # шаги админки (админ проходит всегда, даже если бот выключен)
     if is_admin(uid) and uid in admin_wait:
         step = admin_wait.pop(uid)
 
@@ -1025,6 +1015,11 @@ def on_private_text(message: types.Message):
             bot.reply_to(message, "Текст напоминания сохранён.")
             return
 
+    # Если бот выключен — обычные пользователи не проходят
+    if not is_admin(uid) and not is_bot_enabled():
+        bot.reply_to(message, "⚠️ Бот временно отключён администратором. Попробуйте позже.")
+        return
+
     # обычный текст в личке
     if not is_admin(uid):
         bot.reply_to(message, "Команды: /accfree — список аккаунтов.")
@@ -1034,14 +1029,49 @@ def on_private_text(message: types.Message):
 
 @app.get("/")
 def health():
+    """Health-check endpoint. Render пингует его, чтобы бот не засыпал."""
+    global _last_wake
+    now = time.time()
+    s = load_settings()
+
+    # Каждые 5 минут переподключаем webhook на случай, если Telegram его потерял
+    if WEBHOOK_URL and now - _last_wake > 300:
+        _last_wake = now
+        try:
+            webhook_url = f"{WEBHOOK_URL}/webhook"
+            info = bot.get_webhook_info()
+            if info.url != webhook_url:
+                print(f"[WAKE] webhook mismatch: {info.url!r} -> {webhook_url!r}, resetting...")
+                bot.set_webhook(url=webhook_url)
+            else:
+                print(f"[WAKE] webhook ok: {webhook_url}")
+        except Exception as e:
+            print(f"[WAKE] error: {e}")
+
     return {
         "ok": True,
         "accounts": len(ACCOUNTS),
         "chats": len(known_chats),
         "webhook": bool(WEBHOOK_URL),
         "admin_secret_set": bool(_ADMIN_SECRET),
-        "admin_sessions": len(admin_sessions),
+        "bot_enabled": bool(s.get("bot_enabled", True)),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }, 200
+
+
+@app.get("/wake")
+def wake_endpoint():
+    """Отдельный endpoint для принудительного пробуждения."""
+    global _last_wake
+    _last_wake = time.time()
+    try:
+        if WEBHOOK_URL:
+            webhook_url = f"{WEBHOOK_URL}/webhook"
+            bot.set_webhook(url=webhook_url)
+            return {"ok": True, "webhook": webhook_url}, 200
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+    return {"ok": True}, 200
 
 
 @app.post("/webhook")
@@ -1060,6 +1090,7 @@ def setup_webhook():
     url = f"{WEBHOOK_URL}/webhook"
     try:
         bot.remove_webhook()
+        time.sleep(0.5)
         ok = bot.set_webhook(url=url)
         print(f"Webhook set: {url} -> {ok}")
     except Exception as e:
@@ -1068,27 +1099,16 @@ def setup_webhook():
 
 # ===== Запуск =====
 
-# 1. Восстанавливаем состояние ИЗ ФАЙЛА при старте
-load_state()
-
 setup_webhook()
 
-# 2. Фоновый поток автосохранения (каждые 30 сек)
-_t_state = threading.Thread(target=state_saver_loop, name="state_saver", daemon=True)
-_t_state.start()
-
-# 3. Фоновый поток напоминаний
 _t = threading.Thread(target=reminder_loop, name="reminder", daemon=True)
 _t.start()
 
-# 4. Сохраняем состояние при штатном завершении
-import atexit
-atexit.register(save_state)
-
+s = load_settings()
 print(
     f"Ready | accounts={len(ACCOUNTS)} | chats={len(known_chats)} | "
     f"admin_secret={'yes' if _ADMIN_SECRET else 'NO'} | "
-    f"admin_sessions={len(admin_sessions)}"
+    f"bot_enabled={s.get('bot_enabled', True)}"
 )
 
 if __name__ == "__main__":

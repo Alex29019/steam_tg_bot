@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import secrets as py_secrets
 import threading
 import time
@@ -687,6 +688,7 @@ def show_menu(
             f"📂 <b>Бесплатные аккаунты</b>\nВсего: <b>{len(found)}</b>\n"
             f"Поиск: <code>/accfree название игры</code>\n\n"
             f"🎲 <code>/random</code> — случайный аккаунт\n"
+            f"🎲 <code>/random шутер</code> — случайный по жанру\n"
             f"⭐ <code>/избранное</code> — избранное (только личка)\n"
             f"🎮 <code>/заявка название</code> — запрос игры\n"
             f"🛠 <code>/обход</code> — обход лаунчеров (Rockstar, Ubisoft, EA…)"
@@ -810,6 +812,7 @@ def cmd_start(message: types.Message):
         "<b>/accfree forza</b> - поиск по игре\n"
         "<b>/обход</b> - обход лаунчеров (Rockstar, Ubisoft, EA…)\n"
         "<b>/random</b> - случайный аккаунт\n"
+        "<b>/random шутер</b> - по жанру (гонка, хоррор, рпг…)\n"
         "<b>/избранное</b> - только в личке\n"
         "<b>/заявка игра</b> - запрос на добавление\n\n"
         "Работает в личке и в группах.",
@@ -945,32 +948,86 @@ def cmd_accfree(message: types.Message):
 
 
 
-@bot.message_handler(commands=["random", "rand", "случайный"])
+GENRE_KEYWORDS = {
+    "шутер": ["cs2", "cs:", "counter-strike", "call of duty", "cod ", "battlefield", "doom", "overwatch", "valorant", "pubg", "apex", "rainbow", "far cry", "halo", "titanfall", "hunt"],
+    "гонка": ["forza", "need for speed", "nfs", "assetto", "dirt", "f1", "racing", "gran turismo", "beamng", "crew"],
+    "хоррор": ["phasmophobia", "outlast", "resident evil", "dead by daylight", "lethal company", "horror", "layers of fear", "amnesia", "dead space"],
+    "рпг": ["witcher", "ведьмак", "skyrim", "elders scrolls", "dark souls", "elden ring", "divinity", "dragon age", "fallout", "diablo", "path of exile", "hogwarts"],
+    "стратегия": ["civilization", "age of empires", "total war", "starcraft", "strategy", "company of heroes", "xcom", "cities skylines"],
+    "приключения": ["uncharted", "tomb raider", "assassin", "red dead", "gta", "spider-man", "spiderman", "god of war", "horizon"],
+    "выживание": ["rust", "ark", "minecraft", "valheim", "green hell", "the forest", "subnautica", "dont starve", "dayz"],
+    "спорт": ["fifa", "ea fc", "nba", "nhl", "ufc", "football", "soccer", "rocket league"],
+    "симулятор": ["simulator", "euro truck", "farming", "flight", "sims", "train"],
+}
+
+
+def accounts_by_genre(genre: str) -> list:
+    g = (genre or "").strip().lower()
+    if not g:
+        return list(ACCOUNTS)
+    keys = GENRE_KEYWORDS.get(g)
+    if keys:
+        out = []
+        for a in ACCOUNTS:
+            blob = f"{a.get('g') or ''} {a.get('l') or ''}".lower()
+            if any(k in blob for k in keys):
+                out.append(a)
+        return out
+    # свободный текст = как поиск
+    return search_accounts(g)
+
+
+@bot.message_handler(commands=["random", "rand", "случайный", "genre", "жанр"])
 def cmd_random(message: types.Message):
     if reject_if_banned(message):
         return
-    index_user(message.from_user)
-    uid = message.from_user.id
-    now = time.time()
-    left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
-    if left > 0:
-        bot.reply_to(message, f"⏳ Подожди ещё <b>{int(left) + 1}</b> сек.")
-        return
-    last_cmd[uid] = now
-    if not ACCOUNTS:
-        bot.reply_to(message, "База пуста.")
-        return
-    a = random.choice(ACCOUNTS)
-    set_ctx = user_results
-    key = ctx_key(message.chat.id, uid)
-    set_ctx[key] = {"list": [a], "q": "random"}
-    is_private = message.chat.type == "private"
-    kb = acc_kb_private(0, 0, in_fav=False) if is_private else None
-    bot.reply_to(
-        message,
-        "🎲 <b>Случайный аккаунт</b>\n\n" + fmt_acc(a, 1),
-        reply_markup=kb,
-    )
+    try:
+        index_user(message.from_user)
+        uid = message.from_user.id
+        now = time.time()
+        left = int(CLICK_COOLDOWN - (now - last_cmd.get(uid, 0)))
+        if left > 0:
+            bot.reply_to(message, f"⏳ Подожди ещё <b>{left}</b> сек.")
+            return
+        last_cmd[uid] = now
+
+        if not ACCOUNTS:
+            bot.reply_to(message, "База пуста.")
+            return
+
+        raw = (message.text or "").strip()
+        parts = raw.split(maxsplit=1)
+        genre = parts[1].strip() if len(parts) > 1 else ""
+
+        if not genre:
+            pool = list(ACCOUNTS)
+            title = "🎲 <b>Случайный аккаунт</b>"
+        else:
+            pool = accounts_by_genre(genre)
+            if not pool:
+                genres = ", ".join(sorted(GENRE_KEYWORDS.keys()))
+                bot.reply_to(
+                    message,
+                    f"По «{esc(genre)}» ничего нет.\n\n"
+                    f"Жанры: <code>{genres}</code>\n"
+                    f"Или: <code>/random gta</code>",
+                )
+                return
+            title = f"🎲 <b>Случайный · {esc(genre)}</b> (из {len(pool)})"
+
+        a = random.choice(pool)
+        key = ctx_key(message.chat.id, uid)
+        user_results[key] = {"list": [a], "q": f"random:{genre or 'all'}"}
+        kb = None
+        if message.chat.type == "private":
+            kb = acc_kb_private(0, 0, in_fav=False)
+        bot.reply_to(message, title + "\n\n" + fmt_acc(a, 1), reply_markup=kb)
+    except Exception as e:
+        print("cmd_random error:", e)
+        try:
+            bot.reply_to(message, f"Ошибка random: {esc(str(e))}")
+        except Exception:
+            pass
 
 
 @bot.message_handler(commands=["fav", "favorites", "избранное"])

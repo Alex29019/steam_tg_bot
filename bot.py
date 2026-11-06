@@ -25,12 +25,11 @@ CHATS_FILE = ROOT / "known_chats.json"
 USERS_FILE = ROOT / "chat_users.json"
 SETTINGS_FILE = ROOT / "bot_settings.json"
 SESSIONS_FILE = ROOT / "admin_sessions.json"
-BLOCKED_FILE = ROOT / "blocked_users.json"  # <-- НОВОЕ
+STATE_FILE = ROOT / "bot_state.json"  # <-- НОВОЕ: единый файл состояния
 
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
 
-# Секрет ТОЛЬКО из окружения
 _ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 _ADMIN_IDS = {
@@ -49,102 +48,19 @@ PORT = int(os.getenv("PORT", "10000"))
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
+# Runtime state (теперь персистентный)
 user_results: dict[str, dict] = {}
 last_click: dict[int, float] = {}
 last_cmd: dict[int, float] = {}
 
 admin_sessions: set[int] = set()
 admin_wait: dict[int, str] = {}
-admin_selected: dict[int, set[int]] = {}
+admin_selected: dict[int, list[int]] = {}  # set не сериализуется — используем list
+
 chat_title_cache: dict[int, str] = {}
 
-# ===== БЛОКИРОВКИ =====
-blocked_users: dict[str, dict] = {}  # username_lower -> {"username": str, "user_id": int, "by": str, "at": str}
 
-
-def load_blocked() -> dict:
-    data = load_json(BLOCKED_FILE, {})
-    return data if isinstance(data, dict) else {}
-
-
-def save_blocked() -> None:
-    save_json(BLOCKED_FILE, blocked_users)
-
-
-def refresh_blocked() -> None:
-    global blocked_users
-    blocked_users = load_blocked()
-
-
-def is_blocked(user) -> bool:
-    """Проверка блокировки по username или id."""
-    if not user:
-        return False
-    uid = getattr(user, "id", None)
-    uname = (getattr(user, "username", None) or "").strip().lower().lstrip("@")
-    
-    # по id
-    for entry in blocked_users.values():
-        if entry.get("user_id") and int(entry.get("user_id")) == int(uid or 0):
-            return True
-    
-    # по username
-    if uname and uname in blocked_users:
-        return True
-    
-    return False
-
-
-def block_user(user, admin_name: str) -> tuple[bool, str]:
-    """Добавить пользователя в блок. Возвращает (ok, message)."""
-    if not user:
-        return False, "Не удалось получить данные пользователя"
-    
-    uid = getattr(user, "id", None)
-    uname = (getattr(user, "username", None) or "").strip().lstrip("@")
-    first = getattr(user, "first_name", None) or ""
-    
-    if not uname and not uid:
-        return False, "У пользователя нет username или id"
-    
-    key = uname.lower() if uname else f"id_{uid}"
-    
-    if key in blocked_users:
-        return False, f"Пользователь @{uname or uid} уже заблокирован"
-    
-    blocked_users[key] = {
-        "username": uname or "",
-        "user_id": int(uid or 0),
-        "first_name": first,
-        "by": admin_name,
-        "at": now_str(),
-    }
-    save_blocked()
-    return True, f"✅ @{uname or uid} заблокирован"
-
-
-def unblock_user(username: str) -> tuple[bool, str]:
-    """Разблокировать по username."""
-    uname = username.strip().lower().lstrip("@")
-    if not uname:
-        return False, "Укажи username"
-    
-    if uname in blocked_users:
-        entry = blocked_users.pop(uname)
-        save_blocked()
-        return True, f"✅ @{entry.get('username') or uname} разблокирован"
-    
-    # попробуем найти по id
-    for k, v in list(blocked_users.items()):
-        if str(v.get("user_id")) == uname or str(v.get("username")).lower() == uname:
-            blocked_users.pop(k)
-            save_blocked()
-            return True, f"✅ @{v.get('username') or uname} разблокирован"
-    
-    return False, f"❌ Пользователь @{uname} не найден в списке заблокированных"
-
-
-# ===== УТИЛИТЫ =====
+# ===== ПЕРСИСТЕНТНОСТЬ =====
 
 def load_json(path: Path, default):
     try:
@@ -161,6 +77,61 @@ def save_json(path: Path, data) -> None:
     except Exception as e:
         print("save_json", path, e)
 
+
+def save_state() -> None:
+    """Сохраняет всё runtime-состояние в один файл."""
+    try:
+        state = {
+            "user_results": {k: v for k, v in user_results.items()},
+            "last_click": {str(k): v for k, v in last_click.items()},
+            "last_cmd": {str(k): v for k, v in last_cmd.items()},
+            "admin_wait": {str(k): v for k, v in admin_wait.items()},
+            "admin_selected": {str(k): list(v) for k, v in admin_selected.items()},
+            "admin_sessions": sorted(admin_sessions),
+        }
+        save_json(STATE_FILE, state)
+    except Exception as e:
+        print("save_state error:", e)
+
+
+def load_state() -> None:
+    """Восстанавливает состояние из файла при старте."""
+    global user_results, last_click, last_cmd, admin_wait, admin_selected, admin_sessions
+    try:
+        state = load_json(STATE_FILE, {})
+        if not isinstance(state, dict):
+            return
+
+        user_results = state.get("user_results", {}) or {}
+
+        last_click = {int(k): float(v) for k, v in (state.get("last_click") or {}).items()}
+        last_cmd = {int(k): float(v) for k, v in (state.get("last_cmd") or {}).items()}
+
+        # Очищаем устаревшие КД (старше 5 минут) — чтобы не блокировать пользователей после рестарта
+        now = time.time()
+        last_click = {k: v for k, v in last_click.items() if now - v < 300}
+        last_cmd = {k: v for k, v in last_cmd.items() if now - v < 300}
+
+        admin_wait = {int(k): v for k, v in (state.get("admin_wait") or {}).items()}
+        admin_selected = {int(k): set(v) for k, v in (state.get("admin_selected") or {}).items()}
+        admin_sessions = set(state.get("admin_sessions", []) or [])
+
+        print(f"State restored: sessions={len(admin_sessions)}, wait={len(admin_wait)}, selected={len(admin_selected)}")
+    except Exception as e:
+        print("load_state error:", e)
+
+
+def state_saver_loop() -> None:
+    """Фоновый поток: сохраняет состояние каждые 30 секунд."""
+    while True:
+        try:
+            save_state()
+        except Exception as e:
+            print("state_saver_loop error:", e)
+        time.sleep(30)
+
+
+# ===== НАСТРОЙКИ =====
 
 def load_settings() -> dict:
     s = load_json(SETTINGS_FILE, {})
@@ -184,23 +155,7 @@ def save_settings(s: dict) -> None:
 settings = load_settings()
 
 
-def load_admin_sessions() -> set[int]:
-    data = load_json(SESSIONS_FILE, [])
-    out: set[int] = set()
-    if isinstance(data, list):
-        for x in data:
-            try:
-                out.add(int(x))
-            except Exception:
-                pass
-    return out
-
-
-def save_admin_sessions() -> None:
-    save_json(SESSIONS_FILE, sorted(admin_sessions))
-    admin_sessions.clear()
-    admin_sessions.update(load_admin_sessions())
-
+# ===== ЧАТЫ / ПОЛЬЗОВАТЕЛИ =====
 
 def load_chats() -> set[int]:
     data = load_json(CHATS_FILE, [])
@@ -223,12 +178,6 @@ def load_chat_users() -> dict:
 
 def save_chat_users(data: dict) -> None:
     save_json(USERS_FILE, data)
-
-
-def now_str() -> str:
-    from datetime import datetime, timezone, timedelta
-    MSK = timezone(timedelta(hours=3))
-    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
 
 
 def remember_user(chat_id: int, user) -> None:
@@ -265,10 +214,6 @@ def get_chat_user_list(chat_id: int) -> list:
     return [x for x in lst if isinstance(x, dict) and x.get("id")]
 
 
-def esc(s: str) -> str:
-    return str(s or " ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 def format_mentions(users: list, text: str) -> str:
     parts = []
     for u in users:
@@ -284,7 +229,7 @@ def send_random_mentions(chat_id: int, count, text: str) -> tuple[bool, str]:
     import random as _rnd
     users = get_chat_user_list(chat_id)
     if not users:
-        return False, "Нет известных участников"
+        return False, "Нет известных участников (пусть напишут /accfree в чате)"
     if count is None or count <= 0 or count >= len(users):
         chosen = users
     else:
@@ -306,6 +251,7 @@ def remember_chat(chat_id: int, chat_type: str | None = None) -> None:
         return
     known_chats.add(chat_id)
     save_chats(known_chats)
+    print(f"remember chat {chat_id}, total={len(known_chats)}")
 
 
 def forget_chat(chat_id: int) -> None:
@@ -314,19 +260,19 @@ def forget_chat(chat_id: int) -> None:
         save_chats(known_chats)
 
 
+# ===== АДМИН =====
+
 def is_admin(uid: int) -> bool:
     if uid in _ADMIN_IDS:
         return True
     if uid in admin_sessions:
-        return True
-    if uid in load_admin_sessions():
-        admin_sessions.add(uid)
         return True
     return False
 
 
 def secret_ok(text: str) -> bool:
     if not _ADMIN_SECRET:
+        print("WARN: ADMIN_SECRET empty in Env")
         return False
     got = (text or "").strip()
     exp = _ADMIN_SECRET.strip()
@@ -350,8 +296,47 @@ def get_chat_title(cid: int) -> str:
         return str(cid)
 
 
+def selection_kb(uid: int) -> types.InlineKeyboardMarkup:
+    chats = sorted(load_chats())
+    selected = admin_selected.setdefault(uid, set())
+    kb = types.InlineKeyboardMarkup()
+    for cid in chats[:80]:
+        mark = "✅ " if cid in selected else "⬜ "
+        title = get_chat_title(cid)
+        short = title if len(title) <= 28 else title[:25] + "..."
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{mark} {short}",
+                callback_data=f"adm:sel:{cid}",
+            )
+        )
+    if len(chats) > 80:
+        kb.add(types.InlineKeyboardButton(f"… ещё {len(chats)-80} не показаны", callback_data="noop"))
+    kb.row(
+        types.InlineKeyboardButton("Все", callback_data="adm:selall"),
+        types.InlineKeyboardButton("Сброс", callback_data="adm:selnone"),
+    )
+    kb.add(types.InlineKeyboardButton("🔄 Обновить названия", callback_data="adm:pick"))
+    kb.add(types.InlineKeyboardButton("« Назад", callback_data="adm:panel"))
+    return kb
+
+
+def selection_text(uid: int) -> str:
+    chats = load_chats()
+    selected = admin_selected.get(uid) or set()
+    return (
+        f"🎯 <b>Выбор чатов</b>\n"
+        f"Всего: <b>{len(chats)}</b> · Выбрано: <b>{len(selected)}</b>\n\n"
+        f"Отметь чаты, затем рассылка или напоминание."
+    )
+
+
 def ctx_key(chat_id: int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
+
+
+def esc(s: str) -> str:
+    return str(s or " ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def search_accounts(query: str | None = None) -> list:
@@ -432,41 +417,6 @@ def show_menu(chat_id, user_id, query, reply_to=None, chat_type=None):
         bot.send_message(chat_id, title, reply_markup=kb)
 
 
-def selection_kb(uid: int) -> types.InlineKeyboardMarkup:
-    chats = sorted(load_chats())
-    selected = admin_selected.setdefault(uid, set())
-    kb = types.InlineKeyboardMarkup()
-    for cid in chats[:80]:
-        mark = "✅ " if cid in selected else "⬜ "
-        title = get_chat_title(cid)
-        short = title if len(title) <= 28 else title[:25] + "..."
-        kb.add(
-            types.InlineKeyboardButton(
-                f"{mark} {short}",
-                callback_data=f"adm:sel:{cid}",
-            )
-        )
-    if len(chats) > 80:
-        kb.add(types.InlineKeyboardButton(f"… ещё {len(chats)-80} не показаны", callback_data="noop"))
-    kb.row(
-        types.InlineKeyboardButton("Все", callback_data="adm:selall"),
-        types.InlineKeyboardButton("Сброс", callback_data="adm:selnone"),
-    )
-    kb.add(types.InlineKeyboardButton("🔄 Обновить названия", callback_data="adm:pick"))
-    kb.add(types.InlineKeyboardButton("« Назад", callback_data="adm:panel"))
-    return kb
-
-
-def selection_text(uid: int) -> str:
-    chats = load_chats()
-    selected = admin_selected.get(uid) or set()
-    return (
-        f"🎯 <b>Выбор чатов</b>\n"
-        f"Всего: <b>{len(chats)}</b> · Выбрано: <b>{len(selected)}</b>\n\n"
-        f"Отметь чаты, затем рассылка или напоминание."
-    )
-
-
 def admin_kb() -> types.InlineKeyboardMarkup:
     s = load_settings()
     mins = int(s.get("reminder_interval_min") or 30)
@@ -479,7 +429,6 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton(f"🔔 Авто: {on}", callback_data="adm:toggle"))
     kb.add(types.InlineKeyboardButton("📤 Авто-текст в выбранные", callback_data="adm:test"))
     kb.add(types.InlineKeyboardButton("👥 Отметить людей", callback_data="adm:mention"))
-    kb.add(types.InlineKeyboardButton("🚫 Заблокированные", callback_data="adm:blocked"))  # <-- НОВОЕ
     kb.add(types.InlineKeyboardButton("🚪 Выйти", callback_data="adm:logout"))
     return kb
 
@@ -491,11 +440,9 @@ def admin_panel_text() -> str:
         "🛠 <b>Админ-панель</b>\n\n"
         f"Чатов в базе: <b>{len(chats)}</b>\n"
         f"Авто-сообщения: <b>{'вкл' if s.get('reminders_enabled', True) else 'выкл'}</b>\n"
-        f"Интервал: <b>{int(s.get('reminder_interval_min') or 30)}</b> мин\n"
-        f"Заблокировано: <b>{len(blocked_users)}</b>\n\n"
+        f"Интервал: <b>{int(s.get('reminder_interval_min') or 30)}</b> мин\n\n"
         "1) Выбери чаты\n"
         "2) Рассылка или авто-текст\n"
-        "3) Блок/разблок пользователей\n"
         "Если чата нет в списке — напиши /accfree в той группе."
     )
 
@@ -503,10 +450,12 @@ def admin_panel_text() -> str:
 def send_reminders(manual: bool = False, only: set[int] | None = None) -> tuple[int, int]:
     s = load_settings()
     if not manual and not s.get("reminders_enabled", True):
+        print("reminders disabled, skip")
         return 0, 0
     text = s.get("reminder_text") or "Напомню!!! /accfree "
     chats = list(only) if only is not None else list(load_chats())
-    ok = fail = 0
+    ok = 0
+    fail = 0
     for cid in chats:
         try:
             bot.send_message(cid, text)
@@ -515,7 +464,18 @@ def send_reminders(manual: bool = False, only: set[int] | None = None) -> tuple[
         except Exception as e:
             fail += 1
             err = str(e).lower()
-            if any(x in err for x in ("blocked", "kicked", "deactivated", "chat not found", "forbidden", "have no rights")):
+            print(f"reminder fail {cid}: {e}")
+            if any(
+                x in err
+                for x in (
+                    "blocked",
+                    "kicked",
+                    "deactivated",
+                    "chat not found",
+                    "forbidden",
+                    "have no rights",
+                )
+            ):
                 forget_chat(cid)
     return ok, fail
 
@@ -547,28 +507,10 @@ def broadcast(text: str, only: set[int] | None = None) -> tuple[int, int]:
     return ok, fail
 
 
-# ===== ГЛОБАЛЬНАЯ ПРОВЕРКА БЛОКИРОВКИ =====
-
-def check_blocked(message) -> bool:
-    """Возвращает True если пользователь заблокирован (и шлёт ему уведомление)."""
-    user = getattr(message, "from_user", None)
-    if not user:
-        return False
-    if is_blocked(user):
-        try:
-            bot.reply_to(message, "🚫 Ты заблокирован и не можешь использовать бота.")
-        except Exception:
-            pass
-        return True
-    return False
-
-
 # ===== КОМАНДЫ =====
 
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message):
-    if check_blocked(message):
-        return
     if message.chat.type in ("group", "supergroup"):
         remember_chat(message.chat.id, message.chat.type)
         remember_user(message.chat.id, message.from_user)
@@ -583,8 +525,6 @@ def cmd_start(message: types.Message):
 
 @bot.message_handler(commands=["accfree"])
 def cmd_accfree(message: types.Message):
-    if check_blocked(message):
-        return
     uid = message.from_user.id
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -608,8 +548,6 @@ def cmd_accfree(message: types.Message):
 
 @bot.message_handler(commands=["auth"])
 def cmd_auth(message: types.Message):
-    if check_blocked(message):
-        return
     if message.chat.type != "private":
         bot.reply_to(message, "Только в личке с ботом.")
         return
@@ -619,158 +557,46 @@ def cmd_auth(message: types.Message):
         bot.reply_to(message, "Напиши: <code>/auth секрет</code>")
         return
     if not _ADMIN_SECRET:
-        bot.reply_to(message, "На сервере пустой <b>ADMIN_SECRET</b>.")
+        bot.reply_to(
+            message,
+            "На сервере пустой <b>ADMIN_SECRET</b>. Добавь в Render → Environment.",
+        )
         return
     if secret_ok(parts[1]):
         admin_sessions.add(uid)
-        save_admin_sessions()
+        save_state()  # <-- сохраняем сразу
         try:
             bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
-        bot.send_message(message.chat.id, "✅ Доступ открыт.\nДальше: /admin")
+        bot.send_message(
+            message.chat.id,
+            "✅ Доступ открыт.\nДальше: /admin",
+        )
     else:
         bot.reply_to(message, "Нет доступа.")
 
 
 @bot.message_handler(commands=["admin", "panel"])
 def cmd_admin(message: types.Message):
-    if check_blocked(message):
-        return
     if message.chat.type != "private":
         bot.reply_to(message, "Админка только в личке с ботом.")
         return
     uid = message.from_user.id
     if not is_admin(uid):
-        bot.reply_to(message, "Нет доступа.\nВ личке: <code>/auth ваш_секрет</code>")
+        bot.reply_to(
+            message,
+            "Нет доступа.\nВ личке: <code>/auth ваш_секрет</code>",
+        )
         return
     bot.reply_to(message, admin_panel_text(), reply_markup=admin_kb())
 
 
-# ===== НОВЫЕ КОМАНДЫ БЛОКИРОВКИ =====
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message: types.Message):
+    admin_wait.pop(message.from_user.id, None)
+    bot.reply_to(message, "Ок, отменено.")
 
-@bot.message_handler(commands=["block"])
-def cmd_block(message: types.Message):
-    """Заблокировать пользователя по reply или username."""
-    if check_blocked(message):
-        return
-    if message.chat.type != "private":
-        bot.reply_to(message, "Только в личке.")
-        return
-    uid = message.from_user.id
-    if not is_admin(uid):
-        bot.reply_to(message, "Нет доступа.")
-        return
-    
-    parts = (message.text or "").split(maxsplit=1)
-    
-    # Вариант 1: ответ на сообщение
-    if message.reply_to_message:
-        target_user = message.reply_to_message.from_user
-        ok, msg = block_user(target_user, str(uid))
-        bot.reply_to(message, msg)
-        return
-    
-    # Вариант 2: по username
-    if len(parts) < 2:
-        bot.reply_to(
-            message,
-            "Формат:\n"
-            "• Ответь на сообщение пользователя командой /block\n"
-            "• Или: <code>/block username</code> (без @)"
-        )
-        return
-    
-    target_username = parts[1].strip().lstrip("@").lower()
-    
-    # Сохраняем в блок по username (без user_id, т.к. его нет)
-    if target_username in blocked_users:
-        bot.reply_to(message, f"🚫 @{target_username} уже заблокирован")
-        return
-    
-    blocked_users[target_username] = {
-        "username": target_username,
-        "user_id": 0,
-        "first_name": "",
-        "by": str(uid),
-        "at": now_str(),
-    }
-    save_blocked()
-    bot.reply_to(message, f"✅ @{target_username} заблокирован\n\n<i>Если пользователь напишет боту, его id сохранится автоматически.</i>")
-
-
-@bot.message_handler(commands=["unblock"])
-def cmd_unblock(message: types.Message):
-    """Разблокировать пользователя."""
-    if check_blocked(message):
-        return
-    if message.chat.type != "private":
-        bot.reply_to(message, "Только в личке.")
-        return
-    uid = message.from_user.id
-    if not is_admin(uid):
-        bot.reply_to(message, "Нет доступа.")
-        return
-    
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "Формат: <code>/unblock username</code>")
-        return
-    
-    ok, msg = unblock_user(parts[1])
-    bot.reply_to(message, msg)
-
-
-@bot.message_handler(commands=["blocked", "blocklist"])
-def cmd_blocked_list(message: types.Message):
-    """Список заблокированных."""
-    if check_blocked(message):
-        return
-    if message.chat.type != "private":
-        bot.reply_to(message, "Только в личке.")
-        return
-    uid = message.from_user.id
-    if not is_admin(uid):
-        bot.reply_to(message, "Нет доступа.")
-        return
-    
-    refresh_blocked()
-    
-    if not blocked_users:
-        bot.reply_to(message, "📭 Список заблокированных пуст.")
-        return
-    
-    lines = ["🚫 <b>Заблокированные пользователи:</b>\n"]
-    for i, (key, entry) in enumerate(blocked_users.items(), 1):
-        uname = entry.get("username") or key
-        uid_str = entry.get("user_id") or "—"
-        by = entry.get("by") or "?"
-        at = entry.get("at") or "?"
-        lines.append(
-            f"{i}. @{esc(uname)}\n"
-            f"   ID: <code>{uid_str}</code> · админ: <code>{esc(by)}</code> · {esc(at)}"
-        )
-    
-    text = "\n".join(lines)
-    
-    # Если список длинный — разбиваем на сообщения
-    if len(text) > 4000:
-        chunk = ["🚫 <b>Заблокированные пользователи:</b>\n"]
-        for i, (key, entry) in enumerate(blocked_users.items(), 1):
-            uname = entry.get("username") or key
-            uid_str = entry.get("user_id") or "—"
-            line = f"{i}. @{esc(uname)} (ID: <code>{uid_str}</code>)\n"
-            if len("\n".join(chunk)) + len(line) > 3800:
-                bot.send_message(message.chat.id, "\n".join(chunk), parse_mode="HTML")
-                chunk = []
-            chunk.append(line)
-        if chunk:
-            bot.send_message(message.chat.id, "\n".join(chunk), parse_mode="HTML")
-    else:
-        bot.reply_to(message, text)
-
-
-# ===== ОБРАБОТЧИКИ =====
 
 @bot.my_chat_member_handler()
 def on_my_chat_member(message: types.ChatMemberUpdated):
@@ -800,23 +626,6 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
 
 @bot.inline_handler(lambda query: True)
 def on_inline_query(query: types.InlineQuery):
-    # Блокировка в инлайне
-    if query.from_user and is_blocked(query.from_user):
-        try:
-            bot.answer_inline_query(
-                query.id,
-                [types.InlineQueryResultArticle(
-                    id="blocked",
-                    title="🚫 Вы заблокированы",
-                    description="Использование бота запрещено",
-                    input_message_content=types.InputTextMessageContent("🚫 Вы заблокированы."),
-                )],
-                cache_time=60,
-            )
-        except Exception:
-            pass
-        return
-    
     qtext = (query.query or "").strip()
     uid = query.from_user.id if query.from_user else 0
     results = []
@@ -862,21 +671,18 @@ def on_inline_query(query: types.InlineQuery):
             )
         )
     try:
-        bot.answer_inline_query(query.id, results, cache_time=5, is_personal=True)
+        bot.answer_inline_query(
+            query.id,
+            results,
+            cache_time=5,
+            is_personal=True,
+        )
     except Exception as e:
         print("inline error:", e)
 
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(cq: types.CallbackQuery):
-    # Блокировка в callback
-    if cq.from_user and is_blocked(cq.from_user):
-        try:
-            bot.answer_callback_query(cq.id, "🚫 Вы заблокированы", show_alert=True)
-        except Exception:
-            pass
-        return
-    
     data = cq.data or ""
     uid = cq.from_user.id
     chat_id = cq.message.chat.id if cq.message else 0
@@ -888,64 +694,11 @@ def on_callback(cq: types.CallbackQuery):
             return
         action = data.split(":", 1)[1]
 
-        # <-- НОВОЕ: просмотр списка заблокированных из админки
-        if action == "blocked":
-            bot.answer_callback_query(cq.id)
-            refresh_blocked()
-            if not blocked_users:
-                try:
-                    bot.edit_message_text(
-                        admin_panel_text() + "\n\n📭 Список заблокированных пуст.",
-                        chat_id, cq.message.message_id,
-                        reply_markup=admin_kb(),
-                    )
-                except Exception:
-                    bot.send_message(chat_id, "📭 Список заблокированных пуст.", reply_markup=admin_kb())
-                return
-            
-            lines = ["🚫 <b>Заблокированные:</b>\n\n"]
-            for i, (key, entry) in enumerate(blocked_users.items(), 1):
-                uname = entry.get("username") or key
-                lines.append(f"{i}. @{esc(uname)}")
-            lines.append("\n\nДля разблоки: /unblock username")
-            
-            kb = types.InlineKeyboardMarkup()
-            for key, entry in list(blocked_users.items())[:20]:
-                uname = entry.get("username") or key
-                kb.add(types.InlineKeyboardButton(
-                    f"🔓 Разблок @{uname}",
-                    callback_data=f"adm:unblock:{uname}"
-                ))
-            kb.add(types.InlineKeyboardButton("« Назад", callback_data="adm:panel"))
-            
-            try:
-                bot.edit_message_text(
-                    "".join(lines),
-                    chat_id, cq.message.message_id,
-                    reply_markup=kb,
-                )
-            except Exception:
-                bot.send_message(chat_id, "".join(lines), reply_markup=kb)
-            return
-        
-        if action.startswith("unblock:"):
-            uname = action.split(":", 1)[1]
-            ok, msg = unblock_user(uname)
-            bot.answer_callback_query(cq.id, msg, show_alert=True)
-            # Возвращаемся к списку
-            try:
-                bot.edit_message_reply_markup(
-                    chat_id, cq.message.message_id,
-                    reply_markup=admin_kb(),
-                )
-            except Exception:
-                pass
-            return
-
         if action == "logout":
             admin_sessions.discard(uid)
-            save_admin_sessions()
-           
+            admin_wait.pop(uid, None)
+            admin_selected.pop(uid, None)
+            save_state()  # <-- сохраняем сразу
             bot.answer_callback_query(cq.id, "Вышел")
             try:
                 bot.edit_message_text("Сессия админа закрыта.", chat_id, cq.message.message_id)
@@ -969,7 +722,10 @@ def on_callback(cq: types.CallbackQuery):
             admin_selected.setdefault(uid, set())
             try:
                 bot.edit_message_text(
-                    selection_text(uid), chat_id, cq.message.message_id, reply_markup=selection_kb(uid)
+                    selection_text(uid),
+                    chat_id,
+                    cq.message.message_id,
+                    reply_markup=selection_kb(uid),
                 )
             except Exception:
                 bot.send_message(chat_id, selection_text(uid), reply_markup=selection_kb(uid))
@@ -1052,7 +808,9 @@ def on_callback(cq: types.CallbackQuery):
         if action == "mention":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(cq.id, "Сначала выбери чаты", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id, "Сначала выбери чаты", show_alert=True
+                )
                 return
             admin_wait[uid] = "mention_count"
             bot.answer_callback_query(cq.id)
@@ -1062,6 +820,7 @@ def on_callback(cq: types.CallbackQuery):
                 f"Сколько человек отметить?\n"
                 f"• число (например <code>5</code>) — случайные\n"
                 f"• <code>all</code> — все известные боту\n\n"
+                f"Бот знает только тех, кто писал /accfree в группе.\n"
                 f"Отмена: /cancel",
             )
             return
@@ -1069,7 +828,9 @@ def on_callback(cq: types.CallbackQuery):
         if action == "broadcast":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(cq.id, "Сначала выбери чаты (🎯)", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id, "Сначала выбери чаты (🎯 Выбрать чаты)", show_alert=True
+                )
                 return
             admin_wait[uid] = "broadcast"
             bot.answer_callback_query(cq.id)
@@ -1083,7 +844,9 @@ def on_callback(cq: types.CallbackQuery):
         if action == "test":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(cq.id, "Сначала выбери чаты (🎯)", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id, "Сначала выбери чаты (🎯)", show_alert=True
+                )
                 return
             bot.answer_callback_query(cq.id, "Шлю…")
             ok, fail = send_reminders(manual=True, only=sel)
@@ -1099,7 +862,9 @@ def on_callback(cq: types.CallbackQuery):
         prev = last_click.get(uid, 0)
         left = CLICK_COOLDOWN - (now - prev)
         if left > 0:
-            bot.answer_callback_query(cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False)
+            bot.answer_callback_query(
+                cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False
+            )
             return
         last_click[uid] = now
 
@@ -1155,38 +920,19 @@ def on_callback(cq: types.CallbackQuery):
     bot.answer_callback_query(cq.id)
 
 
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message: types.Message):
-    if check_blocked(message):
-        return
-    admin_wait.pop(message.from_user.id, None)
-    bot.reply_to(message, "Ок, отменено.")
-
-
 @bot.message_handler(
     func=lambda m: bool(m.text)
     and not (m.text or "").startswith("/")
     and m.chat.type == "private"
 )
 def on_private_text(message: types.Message):
-    if check_blocked(message):
-        return
     uid = message.from_user.id
     text = (message.text or "").strip()
-
-    # Авто-сохранение user_id если заблокированный написал боту
-    if is_blocked(message.from_user):
-        uname = (message.from_user.username or "").strip().lower().lstrip("@")
-        if uname and uname in blocked_users:
-            if blocked_users[uname].get("user_id", 0) == 0 and message.from_user.id:
-                blocked_users[uname]["user_id"] = int(message.from_user.id)
-                save_blocked()
-        return
 
     # ввод секрета
     if not is_admin(uid) and secret_ok(text):
         admin_sessions.add(uid)
-        save_admin_sessions()
+        save_state()
         try:
             bot.delete_message(message.chat.id, message.message_id)
         except Exception:
@@ -1269,7 +1015,7 @@ def on_private_text(message: types.Message):
             s = load_settings()
             s["reminder_interval_min"] = mins
             save_settings(s)
-            bot.reply_to(message, f"Интервал: <b>{mins}</b> мин.")
+            bot.reply_to(message, f"Интервал: <b>{mins}</b> мин. Сработает после следующего цикла.")
             return
 
         if step == "text":
@@ -1294,7 +1040,7 @@ def health():
         "chats": len(known_chats),
         "webhook": bool(WEBHOOK_URL),
         "admin_secret_set": bool(_ADMIN_SECRET),
-        "blocked": len(blocked_users),
+        "admin_sessions": len(admin_sessions),
     }, 200
 
 
@@ -1322,17 +1068,27 @@ def setup_webhook():
 
 # ===== Запуск =====
 
-refresh_blocked()  # <-- загружаем список блокировок при старте
+# 1. Восстанавливаем состояние ИЗ ФАЙЛА при старте
+load_state()
 
 setup_webhook()
 
+# 2. Фоновый поток автосохранения (каждые 30 сек)
+_t_state = threading.Thread(target=state_saver_loop, name="state_saver", daemon=True)
+_t_state.start()
+
+# 3. Фоновый поток напоминаний
 _t = threading.Thread(target=reminder_loop, name="reminder", daemon=True)
 _t.start()
+
+# 4. Сохраняем состояние при штатном завершении
+import atexit
+atexit.register(save_state)
 
 print(
     f"Ready | accounts={len(ACCOUNTS)} | chats={len(known_chats)} | "
     f"admin_secret={'yes' if _ADMIN_SECRET else 'NO'} | "
-    f"blocked={len(blocked_users)}"
+    f"admin_sessions={len(admin_sessions)}"
 )
 
 if __name__ == "__main__":

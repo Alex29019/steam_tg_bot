@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
 CHATS_FILE = ROOT / "known_chats.json"
 USERS_FILE = ROOT / "chat_users.json"  # chat_id -> [{id, name}, ...]
+USERS_INDEX_FILE = ROOT / "users_index.json"  # username_lower -> {id, username, name}
 SETTINGS_FILE = ROOT / "bot_settings.json"
 SESSIONS_FILE = ROOT / "admin_sessions.json"
 BANS_FILE = ROOT / "banned_users.json"  # uid -> {reason, at, by}
@@ -148,8 +149,56 @@ def save_chat_users(data: dict) -> None:
     save_json(USERS_FILE, data)
 
 
+def index_user(user) -> None:
+    """Глобальный индекс username -> id (для банов)."""
+    if not user:
+        return
+    uid = getattr(user, "id", None)
+    if not uid or getattr(user, "is_bot", False):
+        return
+    uname = (getattr(user, "username", None) or "").strip()
+    name = getattr(user, "first_name", None) or uname or str(uid)
+    data = load_json(USERS_INDEX_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data[str(uid)] = {
+        "id": int(uid),
+        "username": uname,
+        "name": str(name)[:64],
+    }
+    if uname:
+        data["@" + uname.lower()] = data[str(uid)]
+        data[uname.lower()] = data[str(uid)]
+    save_json(USERS_INDEX_FILE, data)
+
+
+def find_user_in_index(query: str) -> tuple[int | None, str]:
+    """Найти id по username в индексе бота."""
+    raw = (query or "").strip().lstrip("@").lower()
+    if not raw:
+        return None, ""
+    data = load_json(USERS_INDEX_FILE, {})
+    if not isinstance(data, dict):
+        return None, ""
+    if raw.isdigit() and raw in data:
+        e = data[raw]
+        return int(e.get("id") or raw), e.get("username") or ""
+    for key in (raw, "@" + raw):
+        e = data.get(key)
+        if isinstance(e, dict) and e.get("id"):
+            return int(e["id"]), str(e.get("username") or raw)
+    # linear scan
+    for k, e in data.items():
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("username") or "").lower() == raw:
+            return int(e["id"]), str(e.get("username") or raw)
+    return None, ""
+
+
 def remember_user(chat_id: int, user) -> None:
-    """Запомнить участника, который писал в группе (для рандом-отметок)."""
+    """Запомнить участника (индекс + список чата для отметок)."""
+    index_user(user)
     if not user or chat_id > 0:
         return
     uid = getattr(user, "id", None)
@@ -318,21 +367,37 @@ def unban_user(uid: int) -> bool:
 
 
 def resolve_username(text: str) -> tuple[int | None, str, str]:
-    """@user или user -> (id, username, error)."""
+    """@user или user -> (id, username, error).
+    Сначала локальный индекс (кто писал боту), потом Telegram API.
+    """
     raw = (text or "").strip().lstrip("@")
     if not raw:
         return None, "", "Пустой username"
     if raw.isdigit():
         return int(raw), "", ""
+    # 1) наша база
+    uid, uname = find_user_in_index(raw)
+    if uid is not None:
+        return uid, uname or raw, ""
+    # 2) Telegram (часто не работает, пока юзер не писал боту)
     try:
         ch = bot.get_chat("@" + raw)
         uid = getattr(ch, "id", None)
         uname = getattr(ch, "username", None) or raw
         if uid is None:
             return None, raw, "Не удалось получить id"
+        index_user(ch)  # type: ignore
         return int(uid), str(uname), ""
-    except Exception as e:
-        return None, raw, f"Не найден @{raw}: {e}"
+    except Exception:
+        return (
+            None,
+            raw,
+            f"Не найден @{raw}.\n\n"
+            "Telegram не отдаёт id, пока человек <b>сам не напишет боту</b> "
+            "(/start или /accfree).\n"
+            "Пусть напишет боту в личку, потом повтори бан — "
+            "или пришли числовой id (@userinfobot).",
+        )
 
 
 def ban_reply_text(info: dict) -> str:
@@ -634,6 +699,7 @@ def broadcast(text: str, only: set[int] | None = None) -> tuple[int, int]:
 def cmd_start(message: types.Message):
     if reject_if_banned(message):
         return
+    index_user(message.from_user)
     if message.chat.type in ("group", "supergroup"):
         remember_chat(message.chat.id, message.chat.type)
         remember_user(message.chat.id, message.from_user)
@@ -653,6 +719,7 @@ def cmd_obhod(message: types.Message):
     """Выдать архив обхода лаунчеров (Rockstar, Ubisoft, EA и т.д.)."""
     if reject_if_banned(message):
         return
+    index_user(message.from_user)
     uid = message.from_user.id if message.from_user else 0
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -751,6 +818,7 @@ def cmd_obhod(message: types.Message):
 def cmd_accfree(message: types.Message):
     if reject_if_banned(message):
         return
+    index_user(message.from_user)
     uid = message.from_user.id
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -853,6 +921,8 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
 def on_inline_query(query: types.InlineQuery):
     """Инлайн: @bot_username forza — список аккаунтов."""
     uid = query.from_user.id if query.from_user else 0
+    if query.from_user:
+        index_user(query.from_user)
     if uid and is_banned(uid) and not is_admin(uid):
         try:
             bot.answer_inline_query(
@@ -942,6 +1012,7 @@ def on_inline_query(query: types.InlineQuery):
 def on_callback(cq: types.CallbackQuery):
     data = cq.data or ""
     uid = cq.from_user.id
+    index_user(cq.from_user)
     chat_id = cq.message.chat.id if cq.message else 0
 
     # бан (кроме админ-кнопок для админов)
@@ -1274,6 +1345,7 @@ def cmd_cancel(message: types.Message):
     and m.chat.type == "private"
 )
 def on_private_text(message: types.Message):
+    index_user(message.from_user)
     uid = message.from_user.id
     text = (message.text or "").strip()
 

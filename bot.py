@@ -36,6 +36,8 @@ USERS_INDEX_FILE = DATA_DIR / "users_index.json"
 SETTINGS_FILE = DATA_DIR / "bot_settings.json"
 SESSIONS_FILE = DATA_DIR / "admin_sessions.json"
 BANS_FILE = DATA_DIR / "banned_users.json"
+FAV_FILE = DATA_DIR / "favorites.json"  # uid -> [{l,p,g}]
+REQUESTS_FILE = DATA_DIR / "game_requests.json"  # list of requests
 print(f"DATA_DIR={DATA_DIR}")
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
@@ -576,6 +578,87 @@ def fmt_acc(a: dict, n: int | None = None) -> str:
     )
 
 
+
+def load_favorites() -> dict:
+    data = load_json(FAV_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_favorites(data: dict) -> None:
+    save_json(FAV_FILE, data)
+
+
+def get_user_favs(uid: int) -> list:
+    data = load_favorites()
+    lst = data.get(str(uid)) or []
+    return lst if isinstance(lst, list) else []
+
+
+def add_favorite(uid: int, acc: dict) -> tuple[bool, str]:
+    login = (acc.get("l") or "").strip()
+    if not login:
+        return False, "Нет логина"
+    data = load_favorites()
+    key = str(uid)
+    lst = data.get(key) or []
+    if not isinstance(lst, list):
+        lst = []
+    for x in lst:
+        if (x.get("l") or "").lower() == login.lower():
+            return False, "Уже в избранном"
+    lst.insert(0, {"l": acc.get("l"), "p": acc.get("p"), "g": acc.get("g")})
+    if len(lst) > 50:
+        lst = lst[:50]
+    data[key] = lst
+    save_favorites(data)
+    return True, "Добавлено в избранное"
+
+
+def remove_favorite(uid: int, login: str) -> bool:
+    data = load_favorites()
+    key = str(uid)
+    lst = data.get(key) or []
+    if not isinstance(lst, list):
+        return False
+    nl = [x for x in lst if (x.get("l") or "").lower() != login.lower()]
+    if len(nl) == len(lst):
+        return False
+    data[key] = nl
+    save_favorites(data)
+    return True
+
+
+def load_requests() -> list:
+    data = load_json(REQUESTS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_requests(items: list) -> None:
+    save_json(REQUESTS_FILE, items)
+
+
+def add_game_request(uid: int, username: str, game: str) -> None:
+    items = load_requests()
+    items.insert(0, {
+        "uid": uid,
+        "username": username or "",
+        "game": game.strip()[:200],
+        "at": __import__("datetime").datetime.now(
+            __import__("datetime").timezone(__import__("datetime").timedelta(hours=3))
+        ).strftime("%d.%m.%Y %H:%M"),
+    })
+    save_requests(items[:200])
+
+
+def acc_kb_private(idx: int, page: int, in_fav: bool = False) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    if not in_fav:
+        kb.add(types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fv:{idx}:{page}"))
+    else:
+        kb.add(types.InlineKeyboardButton("❌ Убрать из избранного", callback_data=f"fu:{idx}"))
+    return kb
+
+
 def show_menu(
     chat_id: int,
     user_id: int,
@@ -603,8 +686,10 @@ def show_menu(
         else (
             f"📂 <b>Бесплатные аккаунты</b>\nВсего: <b>{len(found)}</b>\n"
             f"Поиск: <code>/accfree название игры</code>\n\n"
-            f"Чтобы обойти лаунчеры (Rockstar, Ubisoft, EA и т.д.)\n"
-            f"напиши команду /обход"
+            f"🎲 <code>/random</code> — случайный аккаунт\n"
+            f"⭐ <code>/избранное</code> — избранное (только личка)\n"
+            f"🎮 <code>/заявка название</code> — запрос игры\n"
+            f"🛠 <code>/обход</code> — обход лаунчеров (Rockstar, Ubisoft, EA…)"
         )
     )
     kb = page_kb(key, 0)
@@ -630,6 +715,7 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("🚫 Забанить", callback_data="adm:ban"))
     kb.add(types.InlineKeyboardButton("✅ Разбанить", callback_data="adm:unban"))
     kb.add(types.InlineKeyboardButton("📋 Список банов", callback_data="adm:banlist"))
+    kb.add(types.InlineKeyboardButton("🎮 Заявки на игры", callback_data="adm:requests"))
     kb.add(types.InlineKeyboardButton("🚪 Выйти", callback_data="adm:logout"))
     return kb
 
@@ -722,7 +808,10 @@ def cmd_start(message: types.Message):
         "Список общих Steam-аккаунтов.\n\n"
         "<b>/accfree</b> - все аккаунты\n"
         "<b>/accfree forza</b> - поиск по игре\n"
-        "<b>/обход</b> - обход лаунчеров (Rockstar, Ubisoft, EA…)\n\n"
+        "<b>/обход</b> - обход лаунчеров (Rockstar, Ubisoft, EA…)\n"
+        "<b>/random</b> - случайный аккаунт\n"
+        "<b>/избранное</b> - только в личке\n"
+        "<b>/заявка игра</b> - запрос на добавление\n\n"
         "Работает в личке и в группах.",
     )
 
@@ -853,6 +942,88 @@ def cmd_accfree(message: types.Message):
         chat_type=message.chat.type,
     )
 
+
+
+
+@bot.message_handler(commands=["random", "rand", "случайный"])
+def cmd_random(message: types.Message):
+    if reject_if_banned(message):
+        return
+    index_user(message.from_user)
+    uid = message.from_user.id
+    now = time.time()
+    left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
+    if left > 0:
+        bot.reply_to(message, f"⏳ Подожди ещё <b>{int(left) + 1}</b> сек.")
+        return
+    last_cmd[uid] = now
+    if not ACCOUNTS:
+        bot.reply_to(message, "База пуста.")
+        return
+    a = random.choice(ACCOUNTS)
+    set_ctx = user_results
+    key = ctx_key(message.chat.id, uid)
+    set_ctx[key] = {"list": [a], "q": "random"}
+    is_private = message.chat.type == "private"
+    kb = acc_kb_private(0, 0, in_fav=False) if is_private else None
+    bot.reply_to(
+        message,
+        "🎲 <b>Случайный аккаунт</b>\n\n" + fmt_acc(a, 1),
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(commands=["fav", "favorites", "избранное"])
+def cmd_fav(message: types.Message):
+    if reject_if_banned(message):
+        return
+    index_user(message.from_user)
+    if message.chat.type != "private":
+        bot.reply_to(message, "⭐ Избранное доступно только в <b>личке</b> с ботом.")
+        return
+    uid = message.from_user.id
+    favs = get_user_favs(uid)
+    if not favs:
+        bot.reply_to(
+            message,
+            "⭐ Избранное пусто.\n"
+            "Открой аккаунт в личке и нажми «В избранное».",
+        )
+        return
+    key = ctx_key(message.chat.id, uid)
+    user_results[key] = {"list": favs, "q": "fav"}
+    lines = [f"⭐ <b>Избранное</b>: {len(favs)}\n"]
+    kb = types.InlineKeyboardMarkup()
+    for i, a in enumerate(favs[:20]):
+        g = a.get("g") or a.get("l") or "?"
+        short = g if len(g) <= 36 else g[:33] + "..."
+        kb.add(types.InlineKeyboardButton(f"{i+1}. {short}", callback_data=f"a:{i}:0"))
+    bot.reply_to(message, "\n".join(lines), reply_markup=kb)
+
+
+@bot.message_handler(commands=["request", "заявка", "want"])
+def cmd_request(message: types.Message):
+    if reject_if_banned(message):
+        return
+    index_user(message.from_user)
+    uid = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 2:
+        bot.reply_to(
+            message,
+            "🎮 Заявка на игру\n\n"
+            "Формат: <code>/заявка название игры</code>\n"
+            "Пример: <code>/заявка Red Dead Redemption 2</code>",
+        )
+        return
+    game = parts[1].strip()
+    uname = message.from_user.username or message.from_user.first_name or str(uid)
+    add_game_request(uid, uname, game)
+    bot.reply_to(
+        message,
+        f"✅ Заявка принята: <b>{esc(game)}</b>\n"
+        "Админы увидят её в панели.",
+    )
 
 
 @bot.message_handler(commands=["auth"])
@@ -1208,6 +1379,34 @@ def on_callback(cq: types.CallbackQuery):
             )
             return
 
+        if action == "requests":
+            bot.answer_callback_query(cq.id)
+            items = load_requests()
+            if not items:
+                bot.send_message(chat_id, "Заявок пока нет.")
+                return
+            lines = []
+            for i, r in enumerate(items[:30]):
+                un = r.get("username") or r.get("uid") or "?"
+                lines.append(
+                    f"{i+1}. <b>{esc(r.get('game'))}</b> — @{esc(un)} · {esc(r.get('at') or '')}"
+                )
+            more = f"\n… ещё {len(items)-30}" if len(items) > 30 else ""
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🗑 Очистить заявки", callback_data="adm:reqclear"))
+            bot.send_message(
+                chat_id,
+                f"🎮 Заявки: <b>{len(items)}</b>\n\n" + "\n".join(lines) + more,
+                reply_markup=kb,
+            )
+            return
+
+        if action == "reqclear":
+            save_requests([])
+            bot.answer_callback_query(cq.id, "Очищено")
+            bot.send_message(chat_id, "Список заявок очищен.")
+            return
+
         if action == "banlist":
             bot.answer_callback_query(cq.id)
             bans = load_bans()
@@ -1334,14 +1533,60 @@ def on_callback(cq: types.CallbackQuery):
         parts = data.split(":")
         try:
             idx = int(parts[1])
+            page = int(parts[2]) if len(parts) > 2 else 0
         except Exception:
             bot.answer_callback_query(cq.id)
             return
         if idx < 0 or idx >= len(found):
             bot.answer_callback_query(cq.id, "Снова /accfree", show_alert=True)
             return
-        bot.send_message(chat_id, fmt_acc(found[idx], idx + 1))
+        a = found[idx]
+        kb = None
+        if cq.message and cq.message.chat.type == "private":
+            favs = get_user_favs(uid)
+            in_fav = any((x.get("l") or "").lower() == (a.get("l") or "").lower() for x in favs)
+            kb = acc_kb_private(idx, page, in_fav=in_fav)
+        bot.send_message(chat_id, fmt_acc(a, idx + 1), reply_markup=kb)
         bot.answer_callback_query(cq.id)
+        return
+
+    # добавить в избранное (только личка)
+    if data.startswith("fv:"):
+        if not cq.message or cq.message.chat.type != "private":
+            bot.answer_callback_query(cq.id, "Только в личке", show_alert=True)
+            return
+        parts = data.split(":")
+        try:
+            idx = int(parts[1])
+        except Exception:
+            bot.answer_callback_query(cq.id)
+            return
+        if idx < 0 or idx >= len(found):
+            bot.answer_callback_query(cq.id, "Открой список снова", show_alert=True)
+            return
+        ok, msg = add_favorite(uid, found[idx])
+        bot.answer_callback_query(cq.id, msg, show_alert=True)
+        return
+
+    if data.startswith("fu:"):
+        if not cq.message or cq.message.chat.type != "private":
+            bot.answer_callback_query(cq.id, "Только в личке", show_alert=True)
+            return
+        parts = data.split(":")
+        try:
+            idx = int(parts[1])
+        except Exception:
+            bot.answer_callback_query(cq.id)
+            return
+        favs = get_user_favs(uid)
+        if idx < 0 or idx >= len(favs):
+            bot.answer_callback_query(cq.id, "Нет в избранном", show_alert=True)
+            return
+        login = favs[idx].get("l") or ""
+        if remove_favorite(uid, login):
+            bot.answer_callback_query(cq.id, "Убрано", show_alert=True)
+        else:
+            bot.answer_callback_query(cq.id, "Не найдено", show_alert=True)
         return
 
     bot.answer_callback_query(cq.id)

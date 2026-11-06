@@ -20,6 +20,13 @@ import telebot
 from flask import Flask, request
 from telebot import types
 
+try:
+    from steam_check_sync import check_steam
+except Exception as _e:
+    print("steam_check_sync import fail:", _e)
+    def check_steam(username, password, captcha_gid="-1", captcha_text=""):
+        return {"status": "error", "message": "Модуль проверки не загружен"}
+
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
 # Постоянные данные: на Render укажи DATA_DIR=/data и Persistent Disk,
@@ -39,6 +46,8 @@ SESSIONS_FILE = DATA_DIR / "admin_sessions.json"
 BANS_FILE = DATA_DIR / "banned_users.json"
 FAV_FILE = DATA_DIR / "favorites.json"  # uid -> [{l,p,g}]
 REQUESTS_FILE = DATA_DIR / "game_requests.json"  # list of requests
+CHECK_STATUS_FILE = DATA_DIR / "check_status.json"  # login -> status
+CHECK_COOLDOWN = 60  # глобально: 1 проверка в минуту на весь бот
 print(f"DATA_DIR={DATA_DIR}")
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
@@ -70,6 +79,8 @@ app = Flask(__name__)
 user_results: dict[str, dict] = {}
 last_click: dict[int, float] = {}
 last_cmd: dict[int, float] = {}
+last_global_check: float = 0.0
+check_lock = False
 # сессии админов после ввода секрета (до рестарта)
 admin_sessions: set[int] = set()
 # ожидание текста рассылки / настройки
@@ -572,12 +583,65 @@ def page_kb(key: str, page: int) -> types.InlineKeyboardMarkup:
 
 def fmt_acc(a: dict, n: int | None = None) -> str:
     head = f"<b>#{n}</b>\n" if n is not None else ""
+    mark = get_check_mark(a.get("l") or "")
+    mark_line = f"\n\n{mark}" if mark else ""
     return (
         f"{head}🎮 <b>{esc(a.get('g') or '—')}</b>\n\n"
         f"👤 Логин:\n<code>{esc(a.get('l'))}</code>\n\n"
         f"🔑 Пароль:\n<code>{esc(a.get('p'))}</code>"
+        f"{mark_line}"
     )
 
+
+
+
+def load_check_status() -> dict:
+    data = load_json(CHECK_STATUS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_check_status(data: dict) -> None:
+    save_json(CHECK_STATUS_FILE, data)
+
+
+def get_check_mark(login: str) -> str:
+    st = load_check_status().get((login or "").lower())
+    if not isinstance(st, dict):
+        return ""
+    status = st.get("status") or ""
+    when = st.get("at") or ""
+    who = st.get("by") or ""
+    if status == "ok":
+        line = f"✅ <b>Работает</b>"
+    elif status == "fail":
+        line = f"❌ <b>Не работает</b>"
+    elif status == "2fa":
+        line = f"❌ <b>Не работает (Steam Guard / 2FA)</b>"
+    elif status == "captcha":
+        line = f"⚠️ <b>Нужна капча</b> (не проверено до конца)"
+    else:
+        line = f"ℹ️ {esc(st.get('message') or status)}"
+    extra = []
+    if when:
+        extra.append(when)
+    if who:
+        extra.append(f"@{esc(who)}" if not str(who).startswith("@") else esc(who))
+    if extra:
+        line += " · " + " · ".join(extra)
+    return line
+
+
+def set_check_result(login: str, status: str, message: str, by: str = "") -> None:
+    from datetime import datetime, timezone, timedelta
+    msk = timezone(timedelta(hours=3))
+    data = load_check_status()
+    data[(login or "").lower()] = {
+        "status": status,
+        "message": message,
+        "at": datetime.now(msk).strftime("%d.%m.%Y %H:%M"),
+        "by": (by or "").lstrip("@"),
+    }
+    save_check_status(data)
 
 
 def load_favorites() -> dict:
@@ -651,12 +715,20 @@ def add_game_request(uid: int, username: str, game: str) -> None:
     save_requests(items[:200])
 
 
-def acc_kb_private(idx: int, page: int, in_fav: bool = False) -> types.InlineKeyboardMarkup:
+def acc_kb_private(idx: int, page: int, in_fav: bool = False, with_check: bool = True) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
+    if with_check:
+        kb.add(types.InlineKeyboardButton("🔍 Проверить", callback_data=f"chk:{idx}:{page}"))
     if not in_fav:
         kb.add(types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fv:{idx}:{page}"))
     else:
         kb.add(types.InlineKeyboardButton("❌ Убрать из избранного", callback_data=f"fu:{idx}"))
+    return kb
+
+
+def acc_kb_public(idx: int, page: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔍 Проверить", callback_data=f"chk:{idx}:{page}"))
     return kb
 
 
@@ -691,7 +763,8 @@ def show_menu(
             f"🎲 <code>/random шутер</code> — случайный по жанру\n"
             f"⭐ <code>/избранное</code> — избранное (только личка)\n"
             f"🎮 <code>/заявка название</code> — запрос игры\n"
-            f"🛠 <code>/обход</code> — обход лаунчеров (Rockstar, Ubisoft, EA…)"
+            f"🛠 <code>/обход</code> — обход лаунчеров (Rockstar, Ubisoft, EA…)\n"
+            f"🔍 Кнопка «Проверить» — 1 раз в минуту на весь бот"
         )
     )
     kb = page_kb(key, 0)
@@ -1018,9 +1091,10 @@ def cmd_random(message: types.Message):
         a = random.choice(pool)
         key = ctx_key(message.chat.id, uid)
         user_results[key] = {"list": [a], "q": f"random:{genre or 'all'}"}
-        kb = None
         if message.chat.type == "private":
-            kb = acc_kb_private(0, 0, in_fav=False)
+            kb = acc_kb_private(0, 0, in_fav=False, with_check=True)
+        else:
+            kb = acc_kb_public(0, 0)
         bot.reply_to(message, title + "\n\n" + fmt_acc(a, 1), reply_markup=kb)
     except Exception as e:
         print("cmd_random error:", e)
@@ -1642,9 +1716,70 @@ def on_callback(cq: types.CallbackQuery):
         if cq.message and cq.message.chat.type == "private":
             favs = get_user_favs(uid)
             in_fav = any((x.get("l") or "").lower() == (a.get("l") or "").lower() for x in favs)
-            kb = acc_kb_private(idx, page, in_fav=in_fav)
+            kb = acc_kb_private(idx, page, in_fav=in_fav, with_check=True)
+        else:
+            kb = acc_kb_public(idx, page)
         bot.send_message(chat_id, fmt_acc(a, idx + 1), reply_markup=kb)
         bot.answer_callback_query(cq.id)
+        return
+
+
+    if data.startswith("chk:"):
+        global last_global_check, check_lock
+        parts = data.split(":")
+        try:
+            idx = int(parts[1])
+            page = int(parts[2]) if len(parts) > 2 else 0
+        except Exception:
+            bot.answer_callback_query(cq.id)
+            return
+        if idx < 0 or idx >= len(found):
+            bot.answer_callback_query(cq.id, "Открой аккаунт снова", show_alert=True)
+            return
+        now = time.time()
+        left = int(CHECK_COOLDOWN - (now - last_global_check))
+        if left > 0:
+            bot.answer_callback_query(
+                cq.id,
+                f"Проверка занята. Подожди {left} сек. (1 раз в минуту)",
+                show_alert=True,
+            )
+            return
+        if check_lock:
+            bot.answer_callback_query(cq.id, "Уже идёт проверка, подожди", show_alert=True)
+            return
+        a = found[idx]
+        login = a.get("l") or ""
+        password = a.get("p") or ""
+        if not login or not password:
+            bot.answer_callback_query(cq.id, "Нет данных", show_alert=True)
+            return
+        check_lock = True
+        last_global_check = now
+        bot.answer_callback_query(cq.id, "Проверяю…")
+        try:
+            bot.send_message(chat_id, f"🔍 Проверяю <code>{esc(login)}</code>…")
+        except Exception:
+            pass
+        try:
+            result = check_steam(login, password)
+        except Exception as e:
+            result = {"status": "error", "message": str(e)}
+        finally:
+            check_lock = False
+        st = result.get("status") or "error"
+        msg = result.get("message") or ""
+        by = (cq.from_user.username or str(uid)) if cq.from_user else str(uid)
+        if st == "success":
+            if "2fa" in msg.lower() or "guard" in msg.lower():
+                set_check_result(login, "fail", msg, by=by)
+            else:
+                set_check_result(login, "ok", msg, by=by)
+        elif st == "captcha":
+            set_check_result(login, "captcha", msg, by=by)
+        else:
+            set_check_result(login, "fail", msg, by=by)
+        bot.send_message(chat_id, fmt_acc(a, idx + 1))
         return
 
     # добавить в избранное (только личка)

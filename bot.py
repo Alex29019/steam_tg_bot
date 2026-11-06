@@ -1491,11 +1491,9 @@ def on_callback(cq: types.CallbackQuery):
                 chat_id,
                 f"📤 Заявка: <b>{esc(game)}</b>\n"
                 f"Кому: @{esc(str(uname))} (<code>{target}</code>)\n\n"
-                f"Пришли аккаунт <b>одним сообщением</b> в формате:\n"
-                f"<code>логин:пароль</code>\n"
-                f"или\n"
-                f"<code>логин:пароль:игры</code>\n\n"
-                f"Человек получит это в личку с ботом.\n"
+                f"Напиши <b>любой ответ</b> одним сообщением "
+                f"(акк, ссылка, текст — как угодно).\n"
+                f"Это уйдёт человеку в личку.\n"
                 f"Отмена: /cancel",
             )
             return
@@ -1772,7 +1770,7 @@ def on_private_text(message: types.Message):
             return
 
         if step.startswith("req_acc:"):
-            # req_acc:target_uid:idx:game
+            # req_acc:target_uid:idx:game — любой текст/медиа-ответ админа
             parts = step.split(":", 3)
             try:
                 target = int(parts[1])
@@ -1781,48 +1779,39 @@ def on_private_text(message: types.Message):
             except Exception:
                 bot.reply_to(message, "Ошибка заявки, начни снова.")
                 return
-            body = text.strip()
-            if not body or ":" not in body:
-                bot.reply_to(
-                    message,
-                    "Формат: <code>логин:пароль</code> или <code>логин:пароль:игры</code>",
-                )
+            body = (text or "").strip()
+            if not body:
+                bot.reply_to(message, "Пустое сообщение. Напиши текст ответа.")
                 admin_wait[uid] = step
                 return
-            bits = body.split(":", 2)
-            login = bits[0].strip()
-            password = bits[1].strip() if len(bits) > 1 else ""
-            games = bits[2].strip() if len(bits) > 2 else game
-            if not login or not password:
-                bot.reply_to(message, "Нужны логин и пароль.")
-                admin_wait[uid] = step
-                return
+            # свободный текст админа
             dm = (
-                f"✅ <b>Ответ на заявку</b>\n"
-                f"Игра: <b>{esc(games or game or '—')}</b>\n\n"
-                f"👤 Логин:\n<code>{esc(login)}</code>\n\n"
-                f"🔑 Пароль:\n<code>{esc(password)}</code>\n\n"
-                f"Если не подойдёт — напиши новую /заявка"
+                f"📩 <b>Ответ на заявку</b>\n"
+                f"Игра: <b>{esc(game or '—')}</b>\n\n"
+                f"{body}"
             )
             try:
                 bot.send_message(target, dm, parse_mode="HTML")
             except Exception as e:
-                bot.reply_to(
-                    message,
-                    f"❌ Не удалось написать в личку (пользователь не запускал бота "
-                    f"или заблокировал):\n{esc(str(e))}",
-                )
-                return
-            # убрать заявку из списка
+                # если HTML сломался из-за символов — шлём как есть
+                try:
+                    bot.send_message(
+                        target,
+                        f"📩 Ответ на заявку\nИгра: {game or '—'}\n\n{body}",
+                        parse_mode=None,
+                    )
+                except Exception as e2:
+                    bot.reply_to(
+                        message,
+                        f"❌ Не удалось написать в личку "
+                        f"(не запускал бота / блок):\n{esc(str(e2))}",
+                    )
+                    return
             items = load_requests()
             if 0 <= idx < len(items) and int(items[idx].get("uid") or 0) == target:
                 items.pop(idx)
                 save_requests(items)
-            bot.reply_to(
-                message,
-                f"✅ Аккаунт отправлен @{esc(str(target))} в личку.\n"
-                f"Заявка закрыта.",
-            )
+            bot.reply_to(message, "✅ Отправлено в личку. Заявка закрыта.")
             return
         if step == "ban_user":
             target, uname, err = resolve_username(text)

@@ -25,6 +25,7 @@ CHATS_FILE = ROOT / "known_chats.json"
 USERS_FILE = ROOT / "chat_users.json"  # chat_id -> [{id, name}, ...]
 SETTINGS_FILE = ROOT / "bot_settings.json"
 SESSIONS_FILE = ROOT / "admin_sessions.json"
+BANS_FILE = ROOT / "banned_users.json"  # uid -> {reason, at, by}
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
 
@@ -244,6 +245,139 @@ def is_admin(uid: int) -> bool:
     return False
 
 
+
+def load_bans() -> dict:
+    data = load_json(BANS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_bans(data: dict) -> None:
+    save_json(BANS_FILE, data)
+
+
+def is_banned(uid: int) -> dict | None:
+    """Вернуть запись бана или None. Просроченные баны снимаются."""
+    data = load_bans()
+    b = data.get(str(uid))
+    if not isinstance(b, dict):
+        return None
+    until = b.get("until")  # unix ts or None = forever
+    if until is not None:
+        try:
+            if time.time() >= float(until):
+                del data[str(uid)]
+                save_bans(data)
+                return None
+        except Exception:
+            pass
+    if b.get("reason") is not None:
+        return b
+    return None
+
+
+def ban_user(
+    uid: int,
+    reason: str,
+    by: str = "",
+    duration: str = "forever",
+    username: str = "",
+) -> None:
+    from datetime import datetime, timezone, timedelta
+    msk = timezone(timedelta(hours=3))
+    now = datetime.now(msk)
+    until_ts = None
+    until_label = "навсегда"
+    if duration == "hour":
+        until_ts = time.time() + 3600
+        until_label = "1 час"
+    elif duration == "day":
+        until_ts = time.time() + 86400
+        until_label = "1 день"
+    elif duration == "year":
+        until_ts = time.time() + 365 * 86400
+        until_label = "1 год"
+    data = load_bans()
+    data[str(uid)] = {
+        "reason": (reason or "без указания причины").strip()[:500],
+        "at": now.strftime("%d.%m.%Y %H:%M"),
+        "by": by or "",
+        "until": until_ts,
+        "until_label": until_label,
+        "username": (username or "").lstrip("@"),
+    }
+    save_bans(data)
+
+
+def unban_user(uid: int) -> bool:
+    data = load_bans()
+    if str(uid) in data:
+        del data[str(uid)]
+        save_bans(data)
+        return True
+    return False
+
+
+def resolve_username(text: str) -> tuple[int | None, str, str]:
+    """@user или user -> (id, username, error)."""
+    raw = (text or "").strip().lstrip("@")
+    if not raw:
+        return None, "", "Пустой username"
+    if raw.isdigit():
+        return int(raw), "", ""
+    try:
+        ch = bot.get_chat("@" + raw)
+        uid = getattr(ch, "id", None)
+        uname = getattr(ch, "username", None) or raw
+        if uid is None:
+            return None, raw, "Не удалось получить id"
+        return int(uid), str(uname), ""
+    except Exception as e:
+        return None, raw, f"Не найден @{raw}: {e}"
+
+
+def ban_reply_text(info: dict) -> str:
+    reason = esc(str(info.get("reason") or "не указана"))
+    at = esc(str(info.get("at") or ""))
+    label = esc(str(info.get("until_label") or "навсегда"))
+    until = info.get("until")
+    until_line = ""
+    if until is not None:
+        try:
+            from datetime import datetime, timezone, timedelta
+            msk = timezone(timedelta(hours=3))
+            until_line = "\n⏳ До: " + datetime.fromtimestamp(float(until), msk).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            until_line = ""
+    extra = f"\n📅 {at}" if at else ""
+    return (
+        "🚫 <b>Вы заблокированы в боте</b>\n\n"
+        f"Причина: {reason}\n"
+        f"Срок: <b>{label}</b>{until_line}{extra}"
+    )
+
+
+def reject_if_banned(message_or_uid, reply_func=None) -> bool:
+    """True = пользователь забанен, ответ уже отправлен."""
+    if hasattr(message_or_uid, "from_user"):
+        uid = message_or_uid.from_user.id
+        msg = message_or_uid
+    else:
+        uid = int(message_or_uid)
+        msg = None
+    if is_admin(uid):
+        return False
+    info = is_banned(uid)
+    if not info:
+        return False
+    text = ban_reply_text(info)
+    if msg is not None:
+        try:
+            bot.reply_to(msg, text)
+        except Exception:
+            bot.send_message(msg.chat.id, text)
+    return True
+
+
 def secret_ok(text: str) -> bool:
     if not _ADMIN_SECRET:
         print("WARN: ADMIN_SECRET empty in Env")
@@ -415,6 +549,9 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton(f"🔔 Авто: {on}", callback_data="adm:toggle"))
     kb.add(types.InlineKeyboardButton("📤 Авто-текст в выбранные", callback_data="adm:test"))
     kb.add(types.InlineKeyboardButton("👥 Отметить людей", callback_data="adm:mention"))
+    kb.add(types.InlineKeyboardButton("🚫 Забанить", callback_data="adm:ban"))
+    kb.add(types.InlineKeyboardButton("✅ Разбанить", callback_data="adm:unban"))
+    kb.add(types.InlineKeyboardButton("📋 Список банов", callback_data="adm:banlist"))
     kb.add(types.InlineKeyboardButton("🚪 Выйти", callback_data="adm:logout"))
     return kb
 
@@ -495,6 +632,8 @@ def broadcast(text: str, only: set[int] | None = None) -> tuple[int, int]:
 
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message):
+    if reject_if_banned(message):
+        return
     if message.chat.type in ("group", "supergroup"):
         remember_chat(message.chat.id, message.chat.type)
         remember_user(message.chat.id, message.from_user)
@@ -512,6 +651,8 @@ def cmd_start(message: types.Message):
 @bot.message_handler(commands=["obhod", "обход", "bypass"])
 def cmd_obhod(message: types.Message):
     """Выдать архив обхода лаунчеров (Rockstar, Ubisoft, EA и т.д.)."""
+    if reject_if_banned(message):
+        return
     uid = message.from_user.id if message.from_user else 0
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -608,6 +749,8 @@ def cmd_obhod(message: types.Message):
 
 @bot.message_handler(commands=["accfree"])
 def cmd_accfree(message: types.Message):
+    if reject_if_banned(message):
+        return
     uid = message.from_user.id
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -709,8 +852,29 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
 @bot.inline_handler(lambda query: True)
 def on_inline_query(query: types.InlineQuery):
     """Инлайн: @bot_username forza — список аккаунтов."""
-    qtext = (query.query or "").strip()
     uid = query.from_user.id if query.from_user else 0
+    if uid and is_banned(uid) and not is_admin(uid):
+        try:
+            bot.answer_inline_query(
+                query.id,
+                [
+                    types.InlineQueryResultArticle(
+                        id="banned",
+                        title="Вы заблокированы",
+                        description=(is_banned(uid) or {}).get("reason") or "",
+                        input_message_content=types.InputTextMessageContent(
+                            ban_reply_text(is_banned(uid) or {"reason": "?"}),
+                            parse_mode="HTML",
+                        ),
+                    )
+                ],
+                cache_time=1,
+                is_personal=True,
+            )
+        except Exception:
+            pass
+        return
+    qtext = (query.query or "").strip()
 
     # лёгкий кд на инлайн (антиспам)
     now = time.time()
@@ -779,6 +943,16 @@ def on_callback(cq: types.CallbackQuery):
     data = cq.data or ""
     uid = cq.from_user.id
     chat_id = cq.message.chat.id if cq.message else 0
+
+    # бан (кроме админ-кнопок для админов)
+    if not data.startswith("adm:") and is_banned(uid) and not is_admin(uid):
+        info = is_banned(uid) or {}
+        bot.answer_callback_query(cq.id, "Вы заблокированы", show_alert=True)
+        try:
+            bot.send_message(chat_id, ban_reply_text(info))
+        except Exception:
+            pass
+        return
 
     # ---- admin callbacks ----
     if data.startswith("adm:"):
@@ -899,6 +1073,79 @@ def on_callback(cq: types.CallbackQuery):
             )
             return
 
+
+
+        if action == "ban":
+            admin_wait[uid] = "ban_user"
+            bot.answer_callback_query(cq.id)
+            bot.send_message(
+                chat_id,
+                "🚫 Пришли <b>@username</b> пользователя\n"
+                "(можно без @). Отмена: /cancel",
+            )
+            return
+
+        if action == "unban":
+            admin_wait[uid] = "unban_user"
+            bot.answer_callback_query(cq.id)
+            bot.send_message(
+                chat_id,
+                "✅ Пришли <b>@username</b> для разбана.\nОтмена: /cancel",
+            )
+            return
+
+        if action.startswith("ban_dur:"):
+            # ban_dur:hour:UID:reason_b64 or store reason in admin_wait
+            parts = action.split(":", 2)
+            # format ban_dur:{hour|day|year|forever}
+            dur = parts[1] if len(parts) > 1 else "forever"
+            st = admin_wait.get(uid) or ""
+            if not st.startswith("ban_pending:"):
+                bot.answer_callback_query(cq.id, "Сначала начни бан заново", show_alert=True)
+                return
+            # ban_pending:uid:username:reason
+            try:
+                _, tuid, uname, reason = st.split(":", 3)
+                tuid_i = int(tuid)
+            except Exception:
+                bot.answer_callback_query(cq.id, "Ошибка данных", show_alert=True)
+                admin_wait.pop(uid, None)
+                return
+            admin_wait.pop(uid, None)
+            by = cq.from_user.username or str(uid)
+            ban_user(tuid_i, reason, by=by, duration=dur, username=uname)
+            bot.answer_callback_query(cq.id, "Забанен")
+            bot.send_message(
+                chat_id,
+                f"🚫 @{esc(uname) or tuid} (<code>{tuid}</code>)\n"
+                f"Причина: {esc(reason)}\n"
+                f"Срок: <b>{esc({'hour':'1 час','day':'1 день','year':'1 год'}.get(dur, 'навсегда'))}</b>",
+            )
+            return
+
+        if action == "banlist":
+            bot.answer_callback_query(cq.id)
+            bans = load_bans()
+            if not bans:
+                bot.send_message(chat_id, "Список банов пуст.")
+                return
+            lines = []
+            for i, (k, v) in enumerate(list(bans.items())[:40]):
+                if not isinstance(v, dict):
+                    continue
+                un = v.get("username") or ""
+                un_s = f"@{esc(un)} " if un else ""
+                lab = esc(v.get("until_label") or "навсегда")
+                lines.append(
+                    f"{un_s}<code>{esc(k)}</code> — {esc(v.get('reason') or '?')} "
+                    f"· {lab} · {esc(v.get('at') or '')}"
+                )
+            more = f"\n… ещё {len(bans) - 40}" if len(bans) > 40 else ""
+            bot.send_message(
+                chat_id,
+                f"📋 Банов: <b>{len(bans)}</b>\n\n" + "\n".join(lines) + more,
+            )
+            return
 
         if action == "mention":
             sel = admin_selected.get(uid) or set()
@@ -1092,6 +1339,55 @@ def on_private_text(message: types.Message):
                 f"Готово. OK: <b>{ok}</b>, ошибок: <b>{fail}</b>\n"
                 + "\n".join(details[:15]),
             )
+            return
+
+        if step == "ban_user":
+            target, uname, err = resolve_username(text)
+            if err or target is None:
+                bot.reply_to(message, f"❌ {esc(err or 'Ошибка')}")
+                admin_wait[uid] = "ban_user"
+                return
+            if is_admin(target):
+                bot.reply_to(message, "Нельзя забанить админа.")
+                return
+            admin_wait[uid] = f"ban_reason:{target}:{uname}"
+            bot.reply_to(
+                message,
+                f"Пользователь @{esc(uname)} (<code>{target}</code>).\n"
+                f"Теперь пришли <b>причину</b> бана.",
+            )
+            return
+        if step.startswith("ban_reason:"):
+            parts = step.split(":", 2)
+            target = int(parts[1])
+            uname = parts[2] if len(parts) > 2 else ""
+            reason = text.strip() or "без указания причины"
+            # reason may contain ":" — already full text
+            admin_wait[uid] = f"ban_pending:{target}:{uname}:{reason}"
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("⏱ 1 час", callback_data="adm:ban_dur:hour"))
+            kb.add(types.InlineKeyboardButton("📅 1 день", callback_data="adm:ban_dur:day"))
+            kb.add(types.InlineKeyboardButton("📆 1 год", callback_data="adm:ban_dur:year"))
+            kb.add(types.InlineKeyboardButton("🔒 Навсегда", callback_data="adm:ban_dur:forever"))
+            bot.reply_to(
+                message,
+                f"Причина: {esc(reason)}\n\nВыбери <b>срок</b> бана:",
+                reply_markup=kb,
+            )
+            return
+        if step == "unban_user":
+            target, uname, err = resolve_username(text)
+            if err or target is None:
+                bot.reply_to(message, f"❌ {esc(err or 'Ошибка')}")
+                admin_wait[uid] = "unban_user"
+                return
+            if unban_user(target):
+                bot.reply_to(
+                    message,
+                    f"✅ Разбанен @{esc(uname)} (<code>{target}</code>)",
+                )
+            else:
+                bot.reply_to(message, "Этого пользователя нет в бане.")
             return
         if step == "broadcast":
             sel = admin_selected.get(uid) or set()

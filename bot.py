@@ -22,14 +22,16 @@ from telebot import types
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
 CHATS_FILE = ROOT / "known_chats.json"
-USERS_FILE = ROOT / "chat_users.json"
+USERS_FILE = ROOT / "chat_users.json"  # chat_id -> [{id, name}, ...]
 SETTINGS_FILE = ROOT / "bot_settings.json"
 SESSIONS_FILE = ROOT / "admin_sessions.json"
-
 PAGE_SIZE = 10
 CLICK_COOLDOWN = 5
 
+# Секрет ТОЛЬКО из окружения — в Git его нет.
+# На Render: ADMIN_SECRET = твоё слово
 _ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
+# Постоянные админы по Telegram user id: "123,456"
 _ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -41,6 +43,10 @@ if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN not set")
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+# Обход лаунчеров: ссылка (рекомендуется для ~400MB) или file_id / локальный путь <50MB
+BYPASS_DOWNLOAD_URL = os.getenv("BYPASS_DOWNLOAD_URL", "").strip()
+BYPASS_FILE_ID = os.getenv("BYPASS_FILE_ID", "").strip()
+BYPASS_ZIP_PATH = os.getenv("BYPASS_ZIP_PATH", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -49,17 +55,14 @@ app = Flask(__name__)
 user_results: dict[str, dict] = {}
 last_click: dict[int, float] = {}
 last_cmd: dict[int, float] = {}
-
+# сессии админов после ввода секрета (до рестарта)
 admin_sessions: set[int] = set()
+# ожидание текста рассылки / настройки
 admin_wait: dict[int, str] = {}
+# uid -> set of chat_ids selected for action
 admin_selected: dict[int, set[int]] = {}
 chat_title_cache: dict[int, str] = {}
 
-# Флаг последнего пробуждения webhook
-_last_wake: float = 0.0
-
-
-# ===== УТИЛИТЫ =====
 
 def load_json(path: Path, default):
     try:
@@ -83,7 +86,6 @@ def load_settings() -> dict:
         s = {}
     s.setdefault("reminder_interval_min", 30)
     s.setdefault("reminders_enabled", True)
-    s.setdefault("bot_enabled", True)  # <-- НОВОЕ: флаг вкл/выкл бота
     s.setdefault(
         "reminder_text",
         "Напомню!!!\n"
@@ -114,9 +116,11 @@ def load_admin_sessions() -> set[int]:
 
 def save_admin_sessions() -> None:
     save_json(SESSIONS_FILE, sorted(admin_sessions))
-    admin_sessions.clear()
-    admin_sessions.update(load_admin_sessions())
-    print("admin sessions:", len(admin_sessions), "secret_set:", bool(_ADMIN_SECRET))
+
+
+admin_sessions.clear()
+admin_sessions.update(load_admin_sessions())
+print("admin sessions:", len(admin_sessions), "secret_set:", bool(_ADMIN_SECRET))
 
 
 def load_chats() -> set[int]:
@@ -133,6 +137,7 @@ def save_chats(chats: set[int]) -> None:
 known_chats: set[int] = load_chats()
 
 
+
 def load_chat_users() -> dict:
     data = load_json(USERS_FILE, {})
     return data if isinstance(data, dict) else {}
@@ -143,6 +148,7 @@ def save_chat_users(data: dict) -> None:
 
 
 def remember_user(chat_id: int, user) -> None:
+    """Запомнить участника, который писал в группе (для рандом-отметок)."""
     if not user or chat_id > 0:
         return
     uid = getattr(user, "id", None)
@@ -156,16 +162,19 @@ def remember_user(chat_id: int, user) -> None:
     data = load_chat_users()
     key = str(chat_id)
     lst = data.get(key) or []
+    # dedupe by id
     ids = {int(x.get("id")) for x in lst if isinstance(x, dict) and x.get("id") is not None}
     if int(uid) in ids:
+        # update name
         for x in lst:
             if int(x.get("id")) == int(uid):
                 x["name"] = str(name)[:64]
                 break
     else:
         lst.append({"id": int(uid), "name": str(name)[:64]})
-    if len(lst) > 500:
-        lst = lst[-500:]
+        # cap per chat
+        if len(lst) > 500:
+            lst = lst[-500:]
     data[key] = lst
     save_chat_users(data)
 
@@ -182,12 +191,12 @@ def format_mentions(users: list, text: str) -> str:
         uid = int(u["id"])
         name = esc(str(u.get("name") or uid))
         parts.append(f'<a href="tg://user?id={uid}">{name}</a>')
-    mentions = "  ".join(parts)
-    body = (text or " ").strip() or "👋 "
+    mentions = " ".join(parts)
+    body = (text or "").strip() or "👋"
     return f"{body}\n\n{mentions}"
 
 
-def send_random_mentions(chat_id: int, count, text: str) -> tuple[bool, str]:
+def send_random_mentions(chat_id: int, count: int | None, text: str) -> tuple[bool, str]:
     import random as _rnd
     users = get_chat_user_list(chat_id)
     if not users:
@@ -205,6 +214,7 @@ def send_random_mentions(chat_id: int, count, text: str) -> tuple[bool, str]:
 
 
 def remember_chat(chat_id: int, chat_type: str | None = None) -> None:
+    # только группы / супергруппы (отрицательные id)
     if chat_id > 0:
         return
     if chat_type and chat_type not in ("group", "supergroup"):
@@ -227,6 +237,7 @@ def is_admin(uid: int) -> bool:
         return True
     if uid in admin_sessions:
         return True
+    # gunicorn workers: подтянуть с диска
     if uid in load_admin_sessions():
         admin_sessions.add(uid)
         return True
@@ -244,6 +255,7 @@ def secret_ok(text: str) -> bool:
     a = hashlib.sha256(got.encode("utf-8")).digest()
     b = hashlib.sha256(exp.encode("utf-8")).digest()
     return py_secrets.compare_digest(a, b)
+
 
 
 def get_chat_title(cid: int) -> str:
@@ -264,9 +276,10 @@ def selection_kb(uid: int) -> types.InlineKeyboardMarkup:
     selected = admin_selected.setdefault(uid, set())
     kb = types.InlineKeyboardMarkup()
     for cid in chats[:80]:
-        mark = "✅ " if cid in selected else "⬜ "
+        mark = "✅" if cid in selected else "⬜"
         title = get_chat_title(cid)
         short = title if len(title) <= 28 else title[:25] + "..."
+        # callback limit 64 bytes; cid fits
         kb.add(
             types.InlineKeyboardButton(
                 f"{mark} {short}",
@@ -299,7 +312,7 @@ def ctx_key(chat_id: int, user_id: int) -> str:
 
 
 def esc(s: str) -> str:
-    return str(s or " ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def search_accounts(query: str | None = None) -> list:
@@ -310,8 +323,8 @@ def search_accounts(query: str | None = None) -> list:
     for a in ACCOUNTS:
         if q in (a.get("l") or "").lower() or q in (a.get("g") or "").lower():
             out.append(a)
-        if len(out) >= 500:
-            break
+            if len(out) >= 500:
+                break
     return out
 
 
@@ -351,9 +364,16 @@ def fmt_acc(a: dict, n: int | None = None) -> str:
     )
 
 
-def show_menu(chat_id, user_id, query, reply_to=None, chat_type=None):
+def show_menu(
+    chat_id: int,
+    user_id: int,
+    query: str | None,
+    reply_to: types.Message | None = None,
+    chat_type: str | None = None,
+):
     if chat_type in ("group", "supergroup") or (chat_type is None and chat_id < 0):
         remember_chat(chat_id, chat_type or "supergroup")
+
     found = search_accounts(query)
     key = ctx_key(chat_id, user_id)
     user_results[key] = {"list": found, "q": (query or "").strip()}
@@ -370,7 +390,9 @@ def show_menu(chat_id, user_id, query, reply_to=None, chat_type=None):
         if q
         else (
             f"📂 <b>Бесплатные аккаунты</b>\nВсего: <b>{len(found)}</b>\n"
-            f"Поиск: <code>/accfree название игры</code>"
+            f"Поиск: <code>/accfree название игры</code>\n\n"
+            f"Чтобы обойти лаунчеры (Rockstar, Ubisoft, EA и т.д.)\n"
+            f"напиши команду /обход"
         )
     )
     kb = page_kb(key, 0)
@@ -384,14 +406,13 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     s = load_settings()
     mins = int(s.get("reminder_interval_min") or 30)
     on = "вкл" if s.get("reminders_enabled", True) else "выкл"
-    bot_on = "🟢 ВКЛ" if s.get("bot_enabled", True) else "🔴 ВЫКЛ"  # <-- НОВОЕ
+    sel_n = 0  # подсказка в тексте панели
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("🎯 Выбрать чаты", callback_data="adm:pick"))
     kb.add(types.InlineKeyboardButton("📣 Рассылка в выбранные", callback_data="adm:broadcast"))
     kb.add(types.InlineKeyboardButton(f"⏱ КД авто: {mins} мин", callback_data="adm:interval"))
     kb.add(types.InlineKeyboardButton("✏️ Текст авто-сообщений", callback_data="adm:text"))
     kb.add(types.InlineKeyboardButton(f"🔔 Авто: {on}", callback_data="adm:toggle"))
-    kb.add(types.InlineKeyboardButton(f"⚡ Бот: {bot_on}", callback_data="adm:toggle_bot"))  # <-- НОВОЕ
     kb.add(types.InlineKeyboardButton("📤 Авто-текст в выбранные", callback_data="adm:test"))
     kb.add(types.InlineKeyboardButton("👥 Отметить людей", callback_data="adm:mention"))
     kb.add(types.InlineKeyboardButton("🚪 Выйти", callback_data="adm:logout"))
@@ -401,16 +422,13 @@ def admin_kb() -> types.InlineKeyboardMarkup:
 def admin_panel_text() -> str:
     s = load_settings()
     chats = load_chats()
-    bot_on = "🟢 <b>ВКЛЮЧЁН</b>" if s.get("bot_enabled", True) else "🔴 <b>ВЫКЛЮЧЕН</b>"
     return (
         "🛠 <b>Админ-панель</b>\n\n"
         f"Чатов в базе: <b>{len(chats)}</b>\n"
-        f"Статус бота: {bot_on}\n"
         f"Авто-сообщения: <b>{'вкл' if s.get('reminders_enabled', True) else 'выкл'}</b>\n"
         f"Интервал: <b>{int(s.get('reminder_interval_min') or 30)}</b> мин\n\n"
         "1) Выбери чаты\n"
         "2) Рассылка или авто-текст\n"
-        "3) Экстренно выключить бота (⚡)\n"
         "Если чата нет в списке — напиши /accfree в той группе."
     )
 
@@ -420,13 +438,10 @@ def send_reminders(manual: bool = False, only: set[int] | None = None) -> tuple[
     if not manual and not s.get("reminders_enabled", True):
         print("reminders disabled, skip")
         return 0, 0
-    # Если бот выключен — не шлём авто-сообщения
-    if not manual and not s.get("bot_enabled", True):
-        print("bot disabled, skip reminders")
-        return 0, 0
-    text = s.get("reminder_text") or "Напомню!!! /accfree "
+    text = s.get("reminder_text") or "Напомню!!! /accfree"
     chats = list(only) if only is not None else list(load_chats())
-    ok = fail = 0
+    ok = 0
+    fail = 0
     for cid in chats:
         try:
             bot.send_message(cid, text)
@@ -436,7 +451,17 @@ def send_reminders(manual: bool = False, only: set[int] | None = None) -> tuple[
             fail += 1
             err = str(e).lower()
             print(f"reminder fail {cid}: {e}")
-            if any(x in err for x in ("blocked", "kicked", "deactivated", "chat not found", "forbidden", "have no rights")):
+            if any(
+                x in err
+                for x in (
+                    "blocked",
+                    "kicked",
+                    "deactivated",
+                    "chat not found",
+                    "forbidden",
+                    "have no rights",
+                )
+            ):
                 forget_chat(cid)
     return ok, fail
 
@@ -468,19 +493,8 @@ def broadcast(text: str, only: set[int] | None = None) -> tuple[int, int]:
     return ok, fail
 
 
-def is_bot_enabled() -> bool:
-    """Проверяет, включен ли бот. Админы всегда проходят."""
-    return load_settings().get("bot_enabled", True)
-
-
-# ===== КОМАНДЫ =====
-
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message):
-    # Админы проходят всегда
-    if not is_admin(message.from_user.id) and not is_bot_enabled():
-        bot.reply_to(message, "⚠️ Бот временно отключён администратором. Попробуйте позже.")
-        return
     if message.chat.type in ("group", "supergroup"):
         remember_chat(message.chat.id, message.chat.type)
         remember_user(message.chat.id, message.from_user)
@@ -488,16 +502,112 @@ def cmd_start(message: types.Message):
         message,
         "Список общих Steam-аккаунтов.\n\n"
         "<b>/accfree</b> - все аккаунты\n"
-        "<b>/accfree forza</b> - поиск по игре\n\n"
+        "<b>/accfree forza</b> - поиск по игре\n"
+        "<b>/обход</b> - обход лаунчеров (Rockstar, Ubisoft, EA…)\n\n"
         "Работает в личке и в группах.",
+    )
+
+
+
+@bot.message_handler(commands=["obhod", "обход", "bypass"])
+def cmd_obhod(message: types.Message):
+    """Выдать архив обхода лаунчеров (Rockstar, Ubisoft, EA и т.д.)."""
+    uid = message.from_user.id if message.from_user else 0
+    now = time.time()
+    left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
+    if left > 0:
+        bot.reply_to(message, f"⏳ Подожди ещё <b>{int(left) + 1}</b> сек.")
+        return
+    last_cmd[uid] = now
+
+    if message.chat.type in ("group", "supergroup"):
+        remember_chat(message.chat.id, message.chat.type)
+        remember_user(message.chat.id, message.from_user)
+
+    caption = (
+        "🛠 <b>Обход лаунчеров</b>\n"
+        "Rockstar / Ubisoft / EA и др.\n\n"
+        "Скачай архив и следуй инструкции внутри."
+    )
+
+    # 1) Готовый file_id (после одной ручной загрузки через @BotFather/локальный API)
+    if BYPASS_FILE_ID:
+        try:
+            bot.send_document(
+                message.chat.id,
+                BYPASS_FILE_ID,
+                caption=caption,
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        except Exception as e:
+            bot.reply_to(message, f"Не удалось отправить по file_id: {esc(str(e))}")
+            return
+
+    # 2) Локальный файл — только если < 49 MB (лимит Bot API)
+    if BYPASS_ZIP_PATH:
+        p = Path(BYPASS_ZIP_PATH)
+        if p.is_file():
+            size = p.stat().st_size
+            if size <= 49 * 1024 * 1024:
+                wait = bot.reply_to(message, "⏳ Отправляю файл…")
+                try:
+                    with open(p, "rb") as f:
+                        bot.send_document(
+                            message.chat.id,
+                            f,
+                            caption=caption,
+                            parse_mode="HTML",
+                            visible_file_name=p.name,
+                        )
+                    try:
+                        bot.delete_message(message.chat.id, wait.message_id)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    bot.reply_to(message, f"Ошибка отправки: {esc(str(e))}")
+                return
+            # слишком большой — только ссылка
+            if BYPASS_DOWNLOAD_URL:
+                bot.reply_to(
+                    message,
+                    caption + "\n\n"
+                    f"📦 Файл большой ({size // (1024*1024)} МБ), Telegram-бот не шлёт >50 МБ.\n"
+                    f"Скачай по ссылке:\n{BYPASS_DOWNLOAD_URL}",
+                )
+                return
+            bot.reply_to(
+                message,
+                caption + "\n\n"
+                f"Файл на сервере {size // (1024*1024)} МБ, лимит бота 50 МБ.\n"
+                "Укажи в Env <code>BYPASS_DOWNLOAD_URL</code> со ссылкой на скачивание.",
+            )
+            return
+        bot.reply_to(message, "BYPASS_ZIP_PATH указан, но файл не найден.")
+        return
+
+    # 3) Только ссылка
+    if BYPASS_DOWNLOAD_URL:
+        bot.reply_to(
+            message,
+            caption + "\n\n"
+            f"📥 Скачать (~400 МБ):\n{BYPASS_DOWNLOAD_URL}",
+        )
+        return
+
+    bot.reply_to(
+        message,
+        "🛠 Обход лаунчеров пока не настроен.\n\n"
+        "Админ: в Render Env добавь один из вариантов:\n"
+        "• <code>BYPASS_DOWNLOAD_URL</code> — прямая ссылка на zip (для ~400 МБ)\n"
+        "• <code>BYPASS_FILE_ID</code> — если файл уже залит в Telegram\n"
+        "• <code>BYPASS_ZIP_PATH</code> — путь к файлу &lt; 50 МБ",
     )
 
 
 @bot.message_handler(commands=["accfree"])
 def cmd_accfree(message: types.Message):
-    if not is_admin(message.from_user.id) and not is_bot_enabled():
-        bot.reply_to(message, "⚠️ Бот временно отключён администратором.")
-        return
     uid = message.from_user.id
     now = time.time()
     left = CLICK_COOLDOWN - (now - last_cmd.get(uid, 0))
@@ -507,7 +617,7 @@ def cmd_accfree(message: types.Message):
     last_cmd[uid] = now
     if message.chat.type in ("group", "supergroup"):
         remember_user(message.chat.id, message.from_user)
-    raw = message.text or " "
+    raw = message.text or ""
     parts = raw.split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
     show_menu(
@@ -519,18 +629,22 @@ def cmd_accfree(message: types.Message):
     )
 
 
+
 @bot.message_handler(commands=["auth"])
 def cmd_auth(message: types.Message):
     if message.chat.type != "private":
         bot.reply_to(message, "Только в личке с ботом.")
         return
     uid = message.from_user.id
-    parts = (message.text or " ").split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         bot.reply_to(message, "Напиши: <code>/auth секрет</code>")
         return
     if not _ADMIN_SECRET:
-        bot.reply_to(message, "На сервере пустой <b>ADMIN_SECRET</b>.")
+        bot.reply_to(
+            message,
+            "На сервере пустой <b>ADMIN_SECRET</b>. Добавь в Render → Environment.",
+        )
         return
     if secret_ok(parts[1]):
         admin_sessions.add(uid)
@@ -539,33 +653,29 @@ def cmd_auth(message: types.Message):
             bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
-        bot.send_message(message.chat.id, "✅ Доступ открыт.\nДальше: /admin")
+        bot.send_message(
+            message.chat.id,
+            "✅ Доступ открыт.\nДальше: /admin",
+            reply_markup=admin_kb(),
+        )
     else:
         bot.reply_to(message, "Нет доступа.")
 
 
 @bot.message_handler(commands=["admin", "panel"])
 def cmd_admin(message: types.Message):
+    """Панель только если уже авторизован (по id или сессии)."""
     if message.chat.type != "private":
         bot.reply_to(message, "Админка только в личке с ботом.")
         return
     uid = message.from_user.id
     if not is_admin(uid):
-        bot.reply_to(message, "Нет доступа.\nВ личке: <code>/auth ваш_секрет</code>")
+        bot.reply_to(
+            message,
+            "Нет доступа.\nВ личке: <code>/auth ваш_секрет</code>",
+        )
         return
     bot.reply_to(message, admin_panel_text(), reply_markup=admin_kb())
-
-
-@bot.message_handler(commands=["wake", "ping"])
-def cmd_wake(message: types.Message):
-    """Команда для принудительного пробуждения бота."""
-    bot.reply_to(message, f"✅ Бот активен!\nВремя: <code>{time.strftime('%H:%M:%S')}</code>")
-
-
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message: types.Message):
-    admin_wait.pop(message.from_user.id, None)
-    bot.reply_to(message, "Ок, отменено.")
 
 
 @bot.my_chat_member_handler()
@@ -579,6 +689,7 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
         if status in ("member", "administrator"):
             if chat.type in ("group", "supergroup"):
                 remember_chat(chat.id, chat.type)
+                # только при реальном добавлении, не при смене прав
                 if old_status in ("left", "kicked", ""):
                     try:
                         bot.send_message(
@@ -594,32 +705,25 @@ def on_my_chat_member(message: types.ChatMemberUpdated):
         print("my_chat_member:", e)
 
 
+
 @bot.inline_handler(lambda query: True)
 def on_inline_query(query: types.InlineQuery):
-    if not is_bot_enabled():
-        try:
-            bot.answer_inline_query(
-                query.id,
-                [types.InlineQueryResultArticle(
-                    id="off",
-                    title="⚠️ Бот временно отключён",
-                    description="Попробуйте позже",
-                    input_message_content=types.InputTextMessageContent("⚠️ Бот временно отключён администратором."),
-                )],
-                cache_time=60,
-            )
-        except Exception:
-            pass
-        return
-
+    """Инлайн: @bot_username forza — список аккаунтов."""
     qtext = (query.query or "").strip()
     uid = query.from_user.id if query.from_user else 0
+
+    # лёгкий кд на инлайн (антиспам)
+    now = time.time()
+    prev = last_cmd.get(uid, 0)
+    # не блокируем полностью — просто не чаще чем раз в 1 сек обновлять тяжело
     results = []
     found = search_accounts(qtext if len(qtext) >= 2 else None)
+    # без запроса — топ/случайная выборка чтобы не слать все 2к
     if len(qtext) < 2:
         found = found[:20]
     else:
         found = found[:30]
+
     for i, a in enumerate(found):
         login = a.get("l") or "?"
         password = a.get("p") or "?"
@@ -631,6 +735,7 @@ def on_inline_query(query: types.InlineQuery):
             f"👤 Логин:\n<code>{esc(login)}</code>\n\n"
             f"🔑 Пароль:\n<code>{esc(password)}</code>"
         )
+        # id must be unique string 1-64 bytes
         rid = f"{i}_{hash(login) % 10_000_000}"
         results.append(
             types.InlineQueryResultArticle(
@@ -644,6 +749,7 @@ def on_inline_query(query: types.InlineQuery):
                 ),
             )
         )
+
     if not results:
         results.append(
             types.InlineQueryResultArticle(
@@ -656,8 +762,14 @@ def on_inline_query(query: types.InlineQuery):
                 ),
             )
         )
+
     try:
-        bot.answer_inline_query(query.id, results, cache_time=5, is_personal=True)
+        bot.answer_inline_query(
+            query.id,
+            results,
+            cache_time=5,
+            is_personal=True,
+        )
     except Exception as e:
         print("inline error:", e)
 
@@ -674,22 +786,6 @@ def on_callback(cq: types.CallbackQuery):
             bot.answer_callback_query(cq.id, "Нет доступа", show_alert=True)
             return
         action = data.split(":", 1)[1]
-
-        # <-- НОВОЕ: вкл/выкл бота
-        if action == "toggle_bot":
-            s = load_settings()
-            s["bot_enabled"] = not s.get("bot_enabled", True)
-            save_settings(s)
-            state = "🟢 ВКЛЮЧЁН" if s["bot_enabled"] else "🔴 ВЫКЛЮЧЕН"
-            bot.answer_callback_query(cq.id, f"Бот {state}", show_alert=True)
-            try:
-                bot.edit_message_text(
-                    admin_panel_text(), chat_id, cq.message.message_id, reply_markup=admin_kb()
-                )
-            except Exception:
-                bot.send_message(chat_id, admin_panel_text(), reply_markup=admin_kb())
-            print(f"[ADMIN] uid={uid} toggled bot_enabled={s['bot_enabled']}")
-            return
 
         if action == "logout":
             admin_sessions.discard(uid)
@@ -718,7 +814,10 @@ def on_callback(cq: types.CallbackQuery):
             admin_selected.setdefault(uid, set())
             try:
                 bot.edit_message_text(
-                    selection_text(uid), chat_id, cq.message.message_id, reply_markup=selection_kb(uid)
+                    selection_text(uid),
+                    chat_id,
+                    cq.message.message_id,
+                    reply_markup=selection_kb(uid),
                 )
             except Exception:
                 bot.send_message(chat_id, selection_text(uid), reply_markup=selection_kb(uid))
@@ -766,6 +865,8 @@ def on_callback(cq: types.CallbackQuery):
                 pass
             return
 
+
+
         if action == "toggle":
             s = load_settings()
             s["reminders_enabled"] = not s.get("reminders_enabled", True)
@@ -794,14 +895,17 @@ def on_callback(cq: types.CallbackQuery):
             bot.answer_callback_query(cq.id)
             bot.send_message(
                 chat_id,
-                "Пришли <b>текст</b> напоминания одним сообщением.\nОтмена: /cancel",
+                "Пришли <b>новый текст</b> напоминания одним сообщением.\nОтмена: /cancel",
             )
             return
+
 
         if action == "mention":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(cq.id, "Сначала выбери чаты", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id, "Сначала выбери чаты", show_alert=True
+                )
                 return
             admin_wait[uid] = "mention_count"
             bot.answer_callback_query(cq.id)
@@ -819,7 +923,9 @@ def on_callback(cq: types.CallbackQuery):
         if action == "broadcast":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(cq.id, "Сначала выбери чаты (🎯 Выбрать чаты)", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id, "Сначала выбери чаты (🎯 Выбрать чаты)", show_alert=True
+                )
                 return
             admin_wait[uid] = "broadcast"
             bot.answer_callback_query(cq.id)
@@ -833,7 +939,9 @@ def on_callback(cq: types.CallbackQuery):
         if action == "test":
             sel = admin_selected.get(uid) or set()
             if not sel:
-                bot.answer_callback_query(cq.id, "Сначала выбери чаты (🎯)", show_alert=True)
+                bot.answer_callback_query(
+                    cq.id, "Сначала выбери чаты (🎯)", show_alert=True
+                )
                 return
             bot.answer_callback_query(cq.id, "Шлю…")
             ok, fail = send_reminders(manual=True, only=sel)
@@ -843,18 +951,15 @@ def on_callback(cq: types.CallbackQuery):
         bot.answer_callback_query(cq.id)
         return
 
-    # Проверка: если бот выключен, обычные пользователи не могут жать кнопки
-    if not is_admin(uid) and not is_bot_enabled():
-        bot.answer_callback_query(cq.id, "⚠️ Бот временно отключён", show_alert=True)
-        return
-
-    # КД только на выбор аккаунта
+    # КД только на выбор аккаунта, листать страницы можно без ожидания
     if data.startswith("a:"):
         now = time.time()
         prev = last_click.get(uid, 0)
         left = CLICK_COOLDOWN - (now - prev)
         if left > 0:
-            bot.answer_callback_query(cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False)
+            bot.answer_callback_query(
+                cq.id, f"Подожди {int(left) + 1} сек.", show_alert=False
+            )
             return
         last_click[uid] = now
 
@@ -910,6 +1015,12 @@ def on_callback(cq: types.CallbackQuery):
     bot.answer_callback_query(cq.id)
 
 
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message: types.Message):
+    admin_wait.pop(message.from_user.id, None)
+    bot.reply_to(message, "Ок, отменено.")
+
+
 @bot.message_handler(
     func=lambda m: bool(m.text)
     and not (m.text or "").startswith("/")
@@ -919,7 +1030,7 @@ def on_private_text(message: types.Message):
     uid = message.from_user.id
     text = (message.text or "").strip()
 
-    # ввод секрета
+    # 1) ввод секрета — только в личке, без упоминаний в help
     if not is_admin(uid) and secret_ok(text):
         admin_sessions.add(uid)
         save_admin_sessions()
@@ -934,10 +1045,9 @@ def on_private_text(message: types.Message):
         )
         return
 
-    # шаги админки (админ проходит всегда, даже если бот выключен)
+    # 2) шаги админки
     if is_admin(uid) and uid in admin_wait:
         step = admin_wait.pop(uid)
-
         if step == "mention_count":
             raw = text.strip().lower()
             if raw in ("all", "все", "0", "-1"):
@@ -952,6 +1062,7 @@ def on_private_text(message: types.Message):
                     admin_wait[uid] = "mention_count"
                     return
             admin_selected.setdefault(uid, set())
+            # store count temporarily
             admin_wait[uid] = f"mention_text:{count if count is not None else 'all'}"
             bot.reply_to(
                 message,
@@ -959,7 +1070,6 @@ def on_private_text(message: types.Message):
                 "Пример: <code>Внимание розыгрыш!</code>",
             )
             return
-
         if step.startswith("mention_text:"):
             mode = step.split(":", 1)[1]
             count = None if mode == "all" else int(mode)
@@ -983,7 +1093,6 @@ def on_private_text(message: types.Message):
                 + "\n".join(details[:15]),
             )
             return
-
         if step == "broadcast":
             sel = admin_selected.get(uid) or set()
             if not sel:
@@ -993,7 +1102,6 @@ def on_private_text(message: types.Message):
             ok, fail = broadcast(text, only=sel)
             bot.send_message(message.chat.id, f"Готово. OK: <b>{ok}</b>, ошибок: <b>{fail}</b>")
             return
-
         if step == "interval":
             try:
                 mins = int(text.strip())
@@ -1007,7 +1115,6 @@ def on_private_text(message: types.Message):
             save_settings(s)
             bot.reply_to(message, f"Интервал: <b>{mins}</b> мин. Сработает после следующего цикла.")
             return
-
         if step == "text":
             s = load_settings()
             s["reminder_text"] = text
@@ -1015,63 +1122,23 @@ def on_private_text(message: types.Message):
             bot.reply_to(message, "Текст напоминания сохранён.")
             return
 
-    # Если бот выключен — обычные пользователи не проходят
-    if not is_admin(uid) and not is_bot_enabled():
-        bot.reply_to(message, "⚠️ Бот временно отключён администратором. Попробуйте позже.")
-        return
-
-    # обычный текст в личке
+    # обычный текст в личке — подсказка
     if not is_admin(uid):
         bot.reply_to(message, "Команды: /accfree — список аккаунтов.")
 
 
-# ===== Flask routes =====
+
+
 
 @app.get("/")
 def health():
-    """Health-check endpoint. Render пингует его, чтобы бот не засыпал."""
-    global _last_wake
-    now = time.time()
-    s = load_settings()
-
-    # Каждые 5 минут переподключаем webhook на случай, если Telegram его потерял
-    if WEBHOOK_URL and now - _last_wake > 300:
-        _last_wake = now
-        try:
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-            info = bot.get_webhook_info()
-            if info.url != webhook_url:
-                print(f"[WAKE] webhook mismatch: {info.url!r} -> {webhook_url!r}, resetting...")
-                bot.set_webhook(url=webhook_url)
-            else:
-                print(f"[WAKE] webhook ok: {webhook_url}")
-        except Exception as e:
-            print(f"[WAKE] error: {e}")
-
     return {
         "ok": True,
         "accounts": len(ACCOUNTS),
         "chats": len(known_chats),
         "webhook": bool(WEBHOOK_URL),
         "admin_secret_set": bool(_ADMIN_SECRET),
-        "bot_enabled": bool(s.get("bot_enabled", True)),
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }, 200
-
-
-@app.get("/wake")
-def wake_endpoint():
-    """Отдельный endpoint для принудительного пробуждения."""
-    global _last_wake
-    _last_wake = time.time()
-    try:
-        if WEBHOOK_URL:
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-            bot.set_webhook(url=webhook_url)
-            return {"ok": True, "webhook": webhook_url}, 200
-    except Exception as e:
-        return {"ok": False, "error": str(e)}, 500
-    return {"ok": True}, 200
 
 
 @app.post("/webhook")
@@ -1090,25 +1157,18 @@ def setup_webhook():
     url = f"{WEBHOOK_URL}/webhook"
     try:
         bot.remove_webhook()
-        time.sleep(0.5)
         ok = bot.set_webhook(url=url)
         print(f"Webhook set: {url} -> {ok}")
     except Exception as e:
         print(f"Webhook error: {e}")
 
 
-# ===== Запуск =====
-
 setup_webhook()
-
 _t = threading.Thread(target=reminder_loop, name="reminder", daemon=True)
 _t.start()
-
-s = load_settings()
 print(
     f"Ready | accounts={len(ACCOUNTS)} | chats={len(known_chats)} | "
-    f"admin_secret={'yes' if _ADMIN_SECRET else 'NO'} | "
-    f"bot_enabled={s.get('bot_enabled', True)}"
+    f"admin_secret={'yes' if _ADMIN_SECRET else 'NO'}"
 )
 
 if __name__ == "__main__":

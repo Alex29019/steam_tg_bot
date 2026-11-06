@@ -1157,6 +1157,95 @@ def cmd_request(message: types.Message):
     )
 
 
+
+@bot.message_handler(commands=["проверка", "proverka", "check"])
+def cmd_proverka(message: types.Message):
+    """ /проверка логин пароль """
+    global last_global_check, check_lock
+    if reject_if_banned(message):
+        return
+    index_user(message.from_user)
+    uid = message.from_user.id
+
+    raw = (message.text or "").strip()
+    # /проверка@Bot login pass
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "🔍 Проверка аккаунта Steam\n\n"
+            "Формат:\n<code>/проверка логин пароль</code>\n\n"
+            "Пример:\n<code>/проверка Kdemwkxk cowldlcls</code>\n\n"
+            "Лимит: 1 проверка в минуту на весь бот.",
+        )
+        return
+
+    rest = parts[1].strip()
+    # login password (password may contain spaces? take first token login, rest password)
+    bits = rest.split(maxsplit=1)
+    if len(bits) < 2:
+        bot.reply_to(
+            message,
+            "Нужны логин и пароль через пробел.\n"
+            "<code>/проверка логин пароль</code>",
+        )
+        return
+    login, password = bits[0].strip(), bits[1].strip()
+    if not login or not password:
+        bot.reply_to(message, "Пустой логин или пароль.")
+        return
+
+    now = time.time()
+    left = int(CHECK_COOLDOWN - (now - last_global_check))
+    if left > 0:
+        bot.reply_to(
+            message,
+            f"⏳ Проверка занята. Подожди <b>{left}</b> сек. (1 раз в минуту)",
+        )
+        return
+    if check_lock:
+        bot.reply_to(message, "⏳ Уже идёт проверка, подожди.")
+        return
+
+    check_lock = True
+    last_global_check = now
+    bot.reply_to(message, f"🔍 Проверяю <code>{esc(login)}</code>…")
+    try:
+        result = check_steam(login, password)
+    except Exception as e:
+        result = {"status": "error", "message": str(e)}
+    finally:
+        check_lock = False
+
+    st = result.get("status") or "error"
+    msg = result.get("message") or ""
+    by = (message.from_user.username or str(uid)) if message.from_user else str(uid)
+
+    if st == "success":
+        if "2fa" in msg.lower() or "guard" in msg.lower():
+            set_check_result(login, "fail", msg, by=by)
+            mark = "❌ <b>Не работает</b> (Steam Guard / 2FA)"
+        else:
+            set_check_result(login, "ok", msg, by=by)
+            mark = "✅ <b>Работает</b>"
+    elif st == "captcha":
+        set_check_result(login, "captcha", msg, by=by)
+        mark = "⚠️ <b>Нужна капча</b> — не удалось проверить до конца"
+    else:
+        set_check_result(login, "fail", msg, by=by)
+        mark = "❌ <b>Не работает</b>"
+
+    from datetime import datetime, timezone, timedelta
+    at = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+    bot.reply_to(
+        message,
+        f"{mark}\n\n"
+        f"👤 <code>{esc(login)}</code>\n"
+        f"📝 {esc(msg)}\n"
+        f"📅 {at}",
+    )
+
+
 @bot.message_handler(commands=["auth"])
 def cmd_auth(message: types.Message):
     if message.chat.type != "private":

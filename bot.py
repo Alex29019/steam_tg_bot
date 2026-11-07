@@ -68,14 +68,45 @@ def encrypt_password(password: str, mod_hex: str, exp_hex: str) -> str:
 _STEAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 
-def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_text: str = "") -> dict:
-    """Проверка через одну Session — иначе капча часто «ломается» со 2-й попытки."""
+
+def _new_steam_session():
+    import requests as _req
+    session = _req.Session()
+    session.headers.update({
+        "User-Agent": _STEAM_UA,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": "https://steamcommunity.com",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    try:
+        session.get(
+            "https://steamcommunity.com/login/home/?goto=",
+            headers={"Referer": "https://steamcommunity.com/"},
+            timeout=15,
+        )
+    except Exception:
+        pass
+    return session
+
+
+def check_steam(
+    username: str,
+    password: str,
+    captcha_gid: str = "-1",
+    captcha_text: str = "",
+    session=None,
+) -> dict:
+    """session — та же, что грузила капчу (иначе Steam отклоняет верный ввод)."""
     if not _CRYPTO_OK:
         return {"status": "error", "message": "На сервере нет pycryptodome (добавь в requirements.txt)"}
     try:
         import requests as _req
     except Exception:
         return {"status": "error", "message": "На сервере нет requests"}
+
+    own_session = session is None
+    if session is None:
+        session = _new_steam_session()
 
     headers = {
         "User-Agent": _STEAM_UA,
@@ -84,19 +115,12 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
         "Origin": "https://steamcommunity.com",
         "X-Requested-With": "XMLHttpRequest",
     }
-    session = _req.Session()
-    session.headers.update(headers)
 
     try:
-        # прогрев cookies
-        try:
-            session.get("https://steamcommunity.com/login/home/", timeout=15)
-        except Exception:
-            pass
-
         r = session.get(
             "https://steamcommunity.com/login/getrsakey",
             params={"username": username, "donotcache": int(time.time() * 1000)},
+            headers=headers,
             timeout=15,
         )
         rsa = r.json()
@@ -128,7 +152,11 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
         r = session.post(
             "https://steamcommunity.com/login/dologin/",
             data=payload,
-            headers={**headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": "https://steamcommunity.com/login/home/?goto=",
+            },
             timeout=15,
         )
         data = r.json()
@@ -146,7 +174,6 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
     if data.get("requires_twofactor") or data.get("emailauth_needed") or data.get("emailsteamid"):
         return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
 
-    # капча нужна / неверная капча — всегда новый gid, не «не работает»
     msg_raw = str(data.get("message") or data.get("strError") or "")
     msg = msg_raw.lower()
     captcha_fail_hints = (
@@ -160,40 +187,58 @@ def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_t
     need_captcha = bool(data.get("captcha_needed")) or any(h in msg for h in captcha_fail_hints)
     if need_captcha:
         gid = str(data.get("captcha_gid") or captcha_gid or "-1")
-        # если текст уже вводили — явно сказать что капча неверная / нужна новая
         if captcha_text:
             return {
                 "status": "captcha",
                 "message": "Капча неверная или устарела — введи с новой картинки",
                 "captcha_gid": gid,
+                "session": session,
             }
         return {
             "status": "captcha",
             "message": "Требуется капча",
             "captcha_gid": gid,
+            "session": session,
         }
 
     if "too many" in msg or "rate" in msg:
         return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
 
-    # после отправки капчи Steam иногда врёт "incorrect password" — даём ещё попытку капчи
-    if captcha_text and data.get("captcha_gid"):
-        return {
-            "status": "captcha",
-            "message": "Steam отклонил вход — попробуй новую капчу",
-            "captcha_gid": str(data.get("captcha_gid")),
-        }
+    # при уже введённой капче не доверяем голому "incorrect password" с datacenter IP
+    if captcha_text:
+        gid = str(data.get("captcha_gid") or captcha_gid or "-1")
+        if data.get("captcha_needed") or data.get("captcha_gid"):
+            return {
+                "status": "captcha",
+                "message": "Steam отклонил капчу — новая картинка",
+                "captcha_gid": gid,
+                "session": session,
+            }
 
-    return {"status": "error", "message": "Аккаунт не работает"}
+    detail = msg_raw.strip() or "Аккаунт не работает"
+    return {"status": "error", "message": detail[:200]}
 
 
 # ===== end steam check =====
 
-def send_steam_captcha(chat_id: int, uid: int, login: str, password: str, gid: str, reply_to: int | None = None) -> None:
-    """Скачать капчу Steam и попросить пользователя ввести текст."""
-    import requests as _req
+
+def send_steam_captcha(
+    chat_id: int,
+    uid: int,
+    login: str,
+    password: str,
+    gid: str,
+    reply_to: int | None = None,
+    session=None,
+) -> None:
+    """Капча в той же Session, что и логин."""
     from io import BytesIO
+
     gid = str(gid or "-1")
+    if session is None:
+        session = captcha_sessions.get(uid) or _new_steam_session()
+    captcha_sessions[uid] = session
+
     pending_captcha[uid] = {
         "login": login,
         "password": password,
@@ -202,9 +247,12 @@ def send_steam_captcha(chat_id: int, uid: int, login: str, password: str, gid: s
     }
     url = f"https://steamcommunity.com/login/rendercaptcha/?gid={gid}"
     try:
-        r = _req.get(
+        r = session.get(
             url,
-            headers={"User-Agent": _STEAM_UA},
+            headers={
+                "User-Agent": _STEAM_UA,
+                "Referer": "https://steamcommunity.com/login/home/?goto=",
+            },
             timeout=15,
         )
         if r.status_code != 200 or not r.content:
@@ -323,6 +371,7 @@ last_cmd: dict[int, float] = {}
 last_global_check: float = 0.0
 check_lock = False
 pending_captcha: dict[int, dict] = {}
+captcha_sessions: dict[int, object] = {}  # uid -> requests.Session
 # сессии админов после ввода секрета (до рестарта)
 admin_sessions: set[int] = set()
 # ожидание текста рассылки / настройки
@@ -1464,7 +1513,15 @@ def cmd_proverka(message: types.Message):
     if st == "captcha":
         gid = str(result.get("captcha_gid") or "-1")
         set_check_result(login, "captcha", result.get("message") or "captcha", by=by)
-        send_steam_captcha(message.chat.id, uid, login, password, gid, reply_to=message.message_id)
+        send_steam_captcha(
+            message.chat.id,
+            uid,
+            login,
+            password,
+            gid,
+            reply_to=message.message_id,
+            session=result.get("session"),
+        )
         return
     finish_check_result(message.chat.id, login, password, result, by)
 
@@ -2084,7 +2141,9 @@ def on_callback(cq: types.CallbackQuery):
         if st == "captcha":
             gid = str(result.get("captcha_gid") or "-1")
             set_check_result(login, "captcha", result.get("message") or "captcha", by=by)
-            send_steam_captcha(chat_id, uid, login, password, gid)
+            send_steam_captcha(
+                chat_id, uid, login, password, gid, session=result.get("session")
+            )
             return
         finish_check_result(chat_id, login, password, result, by, idx=idx, found_list=found)
         return
@@ -2135,6 +2194,7 @@ def on_callback(cq: types.CallbackQuery):
 def cmd_cancel(message: types.Message):
     admin_wait.pop(message.from_user.id, None)
     pending_captcha.pop(message.from_user.id, None)
+    captcha_sessions.pop(message.from_user.id, None)
     bot.reply_to(message, "Ок, отменено.")
 
 
@@ -2160,8 +2220,15 @@ def on_captcha_group(message: types.Message):
     bot.reply_to(message, "🔍 Проверяю с капчей…")
     check_lock = True
     last_global_check = time.time()
+    sess = captcha_sessions.get(uid)
     try:
-        result = check_steam(login, password, captcha_gid=gid, captcha_text=captcha_text)
+        result = check_steam(
+            login,
+            password,
+            captcha_gid=gid,
+            captcha_text=captcha_text,
+            session=sess,
+        )
     except Exception as e:
         result = {"status": "error", "message": str(e)}
     finally:
@@ -2177,8 +2244,10 @@ def on_captcha_group(message: types.Message):
             login,
             password,
             str(result.get("captcha_gid") or "-1"),
+            session=result.get("session") or sess,
         )
         return
+    captcha_sessions.pop(uid, None)
     by = message.from_user.username or str(uid)
     finish_check_result(message.chat.id, login, password, result, by)
 
@@ -2207,21 +2276,35 @@ def on_private_text(message: types.Message):
         bot.reply_to(message, "🔍 Проверяю с капчей…")
         check_lock = True
         last_global_check = time.time()
+        sess = captcha_sessions.get(uid)
         try:
-            result = check_steam(login, password, captcha_gid=gid, captcha_text=captcha_text)
+            result = check_steam(
+                login,
+                password,
+                captcha_gid=gid,
+                captcha_text=captcha_text,
+                session=sess,
+            )
         except Exception as e:
             result = {"status": "error", "message": str(e)}
         finally:
             check_lock = False
-        # если снова капча — новая картинка (не помечаем «не работает»)
         if (result.get("status") or "") == "captcha":
             bot.reply_to(
                 message,
                 "⚠️ Капча не принята. Ниже новая картинка — введи её заново.",
             )
             new_gid = str(result.get("captcha_gid") or "-1")
-            send_steam_captcha(message.chat.id, uid, login, password, new_gid)
+            send_steam_captcha(
+                message.chat.id,
+                uid,
+                login,
+                password,
+                new_gid,
+                session=result.get("session") or sess,
+            )
             return
+        captcha_sessions.pop(uid, None)
         by = message.from_user.username or str(uid)
         finish_check_result(message.chat.id, login, password, result, by)
         return

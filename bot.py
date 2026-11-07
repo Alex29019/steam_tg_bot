@@ -166,8 +166,12 @@ def send_steam_captcha(chat_id: int, uid: int, login: str, password: str, gid: s
         bio.name = "captcha.png"
         caption = (
             "⚠️ <b>Steam просит капчу</b>\n\n"
-            f"Логин: <code>{esc(login)}</code>\n"
-            "Пришли <b>текст с картинки</b> одним сообщением.\n"
+            f"Логин: <code>{esc(login)}</code>\n\n"
+            "Пришли <b>текст с картинки</b> одним сообщением.\n\n"
+            "Вот пример ответа на капчу:\n"
+            "<code>Ueu@cv</code>\n\n"
+            "(Первая буква большая, а другие маленькие, "
+            "<b>ОБЯЗАТЕЛЬНО ПИСАТЬ ИМЕННО ТАК</b>)\n\n"
             "Отмена: /cancel"
         )
         bot.send_photo(

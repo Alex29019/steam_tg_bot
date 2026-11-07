@@ -20,12 +20,197 @@ import telebot
 from flask import Flask, request
 from telebot import types
 
+
+# ===== Steam check (inlined) =====
+import base64
+from typing import Any as _Any
+
 try:
-    from steam_check_sync import check_steam
-except Exception as _e:
-    print("steam_check_sync import fail:", _e)
-    def check_steam(username, password, captcha_gid="-1", captcha_text=""):
-        return {"status": "error", "message": "Модуль проверки не загружен"}
+    from Crypto.Cipher import PKCS1_v1_5
+    from Crypto.PublicKey import RSA
+    _CRYPTO_OK = True
+except Exception as _ce:
+    print("Crypto import fail:", _ce)
+    _CRYPTO_OK = False
+
+def _der_length(n: int) -> bytes:
+    if n < 128:
+        return bytes([n])
+    b = []
+    while n:
+        b.insert(0, n & 0xFF)
+        n >>= 8
+    return bytes([0x80 | len(b), *b])
+
+def _der_tag(tag: int, content: bytes) -> bytes:
+    return bytes([tag]) + _der_length(len(content)) + content
+
+def _der_int(buf: bytes) -> bytes:
+    if buf and (buf[0] & 0x80):
+        buf = b"\x00" + buf
+    return _der_tag(0x02, buf)
+
+def build_rsa_pem(mod_hex: str, exp_hex: str) -> bytes:
+    mod = bytes.fromhex(mod_hex)
+    exp = bytes.fromhex(exp_hex)
+    rsa_key = _der_tag(0x30, _der_int(mod) + _der_int(exp))
+    alg = _der_tag(0x30, _der_tag(0x06, bytes.fromhex("2a864886f70d010101")) + _der_tag(0x05, b""))
+    spki = _der_tag(0x30, alg + _der_tag(0x03, b"\x00" + rsa_key))
+    b64 = base64.b64encode(spki).decode()
+    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
+    return ("-----BEGIN PUBLIC KEY-----\n" + "\n".join(lines) + "\n-----END PUBLIC KEY-----").encode()
+
+def encrypt_password(password: str, mod_hex: str, exp_hex: str) -> str:
+    key = RSA.import_key(build_rsa_pem(mod_hex, exp_hex))
+    enc = PKCS1_v1_5.new(key).encrypt(password.encode("utf-8"))
+    return base64.b64encode(enc).decode()
+
+_STEAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+def check_steam(username: str, password: str, captcha_gid: str = "-1", captcha_text: str = "") -> dict:
+    if not _CRYPTO_OK:
+        return {"status": "error", "message": "На сервере нет pycryptodome (добавь в requirements.txt)"}
+    try:
+        import requests as _req
+    except Exception:
+        return {"status": "error", "message": "На сервере нет requests"}
+    headers = {
+        "User-Agent": _STEAM_UA,
+        "Referer": "https://steamcommunity.com/login/home/?goto=",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": "https://steamcommunity.com",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        r = _req.get(
+            "https://steamcommunity.com/login/getrsakey",
+            params={"username": username, "donotcache": int(time.time() * 1000)},
+            headers=headers,
+            timeout=15,
+        )
+        rsa = r.json()
+    except Exception as e:
+        return {"status": "error", "message": f"Ошибка сети (RSA): {e}"}
+    if not rsa or not rsa.get("success"):
+        return {"status": "error", "message": "Аккаунт не работает"}
+    try:
+        enc_pass = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
+    except Exception as e:
+        return {"status": "error", "message": f"Ошибка шифрования: {e}"}
+    payload = {
+        "username": username,
+        "password": enc_pass,
+        "twofactorcode": "",
+        "emailauth": "",
+        "loginfriendlyname": "",
+        "captchagid": captcha_gid or "-1",
+        "captcha_text": captcha_text or "",
+        "emailsteamid": "",
+        "rsatimestamp": rsa["timestamp"],
+        "remember_login": "false",
+        "donotcache": str(int(time.time() * 1000)),
+    }
+    try:
+        r = _req.post(
+            "https://steamcommunity.com/login/dologin/",
+            data=payload,
+            headers={**headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            timeout=15,
+        )
+        data = r.json()
+    except Exception as e:
+        return {"status": "error", "message": f"Ошибка сети (login): {e}"}
+    if isinstance(data, str):
+        return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
+    if not isinstance(data, dict):
+        return {"status": "error", "message": "Аккаунт не работает"}
+    if data.get("success") is True:
+        return {"status": "success", "message": "Аккаунт работает"}
+    if data.get("requires_twofactor") or data.get("emailauth_needed") or data.get("emailsteamid"):
+        return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
+    if data.get("captcha_needed"):
+        return {"status": "captcha", "message": "Требуется капча", "captcha_gid": str(data.get("captcha_gid") or "-1")}
+    msg = str(data.get("message") or data.get("strError") or "").lower()
+    if "too many" in msg or "rate" in msg:
+        return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
+    return {"status": "error", "message": "Аккаунт не работает"}
+
+# ===== end steam check =====
+
+def send_steam_captcha(chat_id: int, uid: int, login: str, password: str, gid: str, reply_to: int | None = None) -> None:
+    """Скачать капчу Steam и попросить пользователя ввести текст."""
+    import requests as _req
+    from io import BytesIO
+    gid = str(gid or "-1")
+    pending_captcha[uid] = {
+        "login": login,
+        "password": password,
+        "gid": gid,
+        "chat_id": chat_id,
+    }
+    url = f"https://steamcommunity.com/login/rendercaptcha/?gid={gid}"
+    try:
+        r = _req.get(
+            url,
+            headers={"User-Agent": _STEAM_UA},
+            timeout=15,
+        )
+        if r.status_code != 200 or not r.content:
+            bot.send_message(
+                chat_id,
+                "⚠️ Steam запросил капчу, но картинку получить не удалось.\n"
+                "Попробуй /проверка ещё раз через минуту.",
+            )
+            return
+        bio = BytesIO(r.content)
+        bio.name = "captcha.png"
+        caption = (
+            "⚠️ <b>Steam просит капчу</b>\n\n"
+            f"Логин: <code>{esc(login)}</code>\n"
+            "Пришли <b>текст с картинки</b> одним сообщением.\n"
+            "Отмена: /cancel"
+        )
+        bot.send_photo(
+            chat_id,
+            bio,
+            caption=caption,
+            parse_mode="HTML",
+            reply_to_message_id=reply_to,
+        )
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ Капча нужна, ошибка загрузки: {esc(str(e))}")
+
+
+def finish_check_result(chat_id: int, login: str, password: str, result: dict, by: str, idx: int | None = None, found_list: list | None = None) -> None:
+    st = result.get("status") or "error"
+    msg = result.get("message") or ""
+    if st == "success":
+        if "2fa" in msg.lower() or "guard" in msg.lower():
+            set_check_result(login, "fail", msg, by=by)
+            mark = "❌ <b>Не работает</b> (Steam Guard / 2FA)"
+        else:
+            set_check_result(login, "ok", msg, by=by)
+            mark = "✅ <b>Работает</b>"
+    elif st == "captcha":
+        set_check_result(login, "captcha", msg, by=by)
+        mark = "⚠️ <b>Нужна капча</b>"
+    else:
+        set_check_result(login, "fail", msg, by=by)
+        mark = "❌ <b>Не работает</b>"
+    from datetime import datetime, timezone, timedelta
+    at = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+    body = (
+        f"{mark}\n\n"
+        f"👤 <code>{esc(login)}</code>\n"
+        f"📝 {esc(msg)}\n"
+        f"📅 {at}"
+    )
+    if found_list is not None and idx is not None and 0 <= idx < len(found_list):
+        body = fmt_acc(found_list[idx], idx + 1)
+    bot.send_message(chat_id, body)
+
+
+
 
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = json.loads((ROOT / "accounts.json").read_text(encoding="utf-8"))
@@ -81,6 +266,7 @@ last_click: dict[int, float] = {}
 last_cmd: dict[int, float] = {}
 last_global_check: float = 0.0
 check_lock = False
+pending_captcha: dict[int, dict] = {}
 # сессии админов после ввода секрета (до рестарта)
 admin_sessions: set[int] = set()
 # ожидание текста рассылки / настройки
@@ -1217,33 +1403,14 @@ def cmd_proverka(message: types.Message):
     finally:
         check_lock = False
 
-    st = result.get("status") or "error"
-    msg = result.get("message") or ""
     by = (message.from_user.username or str(uid)) if message.from_user else str(uid)
-
-    if st == "success":
-        if "2fa" in msg.lower() or "guard" in msg.lower():
-            set_check_result(login, "fail", msg, by=by)
-            mark = "❌ <b>Не работает</b> (Steam Guard / 2FA)"
-        else:
-            set_check_result(login, "ok", msg, by=by)
-            mark = "✅ <b>Работает</b>"
-    elif st == "captcha":
-        set_check_result(login, "captcha", msg, by=by)
-        mark = "⚠️ <b>Нужна капча</b> — не удалось проверить до конца"
-    else:
-        set_check_result(login, "fail", msg, by=by)
-        mark = "❌ <b>Не работает</b>"
-
-    from datetime import datetime, timezone, timedelta
-    at = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
-    bot.reply_to(
-        message,
-        f"{mark}\n\n"
-        f"👤 <code>{esc(login)}</code>\n"
-        f"📝 {esc(msg)}\n"
-        f"📅 {at}",
-    )
+    st = result.get("status") or "error"
+    if st == "captcha":
+        gid = str(result.get("captcha_gid") or "-1")
+        set_check_result(login, "captcha", result.get("message") or "captcha", by=by)
+        send_steam_captcha(message.chat.id, uid, login, password, gid, reply_to=message.message_id)
+        return
+    finish_check_result(message.chat.id, login, password, result, by)
 
 
 @bot.message_handler(commands=["auth"])
@@ -1856,19 +2023,14 @@ def on_callback(cq: types.CallbackQuery):
             result = {"status": "error", "message": str(e)}
         finally:
             check_lock = False
-        st = result.get("status") or "error"
-        msg = result.get("message") or ""
         by = (cq.from_user.username or str(uid)) if cq.from_user else str(uid)
-        if st == "success":
-            if "2fa" in msg.lower() or "guard" in msg.lower():
-                set_check_result(login, "fail", msg, by=by)
-            else:
-                set_check_result(login, "ok", msg, by=by)
-        elif st == "captcha":
-            set_check_result(login, "captcha", msg, by=by)
-        else:
-            set_check_result(login, "fail", msg, by=by)
-        bot.send_message(chat_id, fmt_acc(a, idx + 1))
+        st = result.get("status") or "error"
+        if st == "captcha":
+            gid = str(result.get("captcha_gid") or "-1")
+            set_check_result(login, "captcha", result.get("message") or "captcha", by=by)
+            send_steam_captcha(chat_id, uid, login, password, gid)
+            return
+        finish_check_result(chat_id, login, password, result, by, idx=idx, found_list=found)
         return
 
     # добавить в избранное (только личка)
@@ -1916,7 +2078,43 @@ def on_callback(cq: types.CallbackQuery):
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message: types.Message):
     admin_wait.pop(message.from_user.id, None)
+    pending_captcha.pop(message.from_user.id, None)
     bot.reply_to(message, "Ок, отменено.")
+
+
+
+@bot.message_handler(
+    func=lambda m: bool(m.text)
+    and not (m.text or "").startswith("/")
+    and m.from_user is not None
+    and m.from_user.id in pending_captcha
+    and m.chat.type in ("group", "supergroup"),
+    content_types=["text"],
+)
+def on_captcha_group(message: types.Message):
+    uid = message.from_user.id
+    if uid not in pending_captcha:
+        return
+    global last_global_check, check_lock
+    info = pending_captcha.pop(uid)
+    captcha_text = (message.text or "").strip()
+    login = info.get("login") or ""
+    password = info.get("password") or ""
+    gid = info.get("gid") or "-1"
+    bot.reply_to(message, "🔍 Проверяю с капчей…")
+    check_lock = True
+    last_global_check = time.time()
+    try:
+        result = check_steam(login, password, captcha_gid=gid, captcha_text=captcha_text)
+    except Exception as e:
+        result = {"status": "error", "message": str(e)}
+    finally:
+        check_lock = False
+    if (result.get("status") or "") == "captcha":
+        send_steam_captcha(message.chat.id, uid, login, password, str(result.get("captcha_gid") or gid))
+        return
+    by = message.from_user.username or str(uid)
+    finish_check_result(message.chat.id, login, password, result, by)
 
 
 @bot.message_handler(
@@ -1928,6 +2126,36 @@ def on_private_text(message: types.Message):
     index_user(message.from_user)
     uid = message.from_user.id
     text = (message.text or "").strip()
+
+    # капча Steam — ответ текстом
+    if uid in pending_captcha and not (text.startswith("/")):
+        global last_global_check, check_lock
+        info = pending_captcha.pop(uid)
+        captcha_text = text.strip()
+        if not captcha_text:
+            bot.reply_to(message, "Пустая капча. Попробуй /проверка снова.")
+            return
+        login = info.get("login") or ""
+        password = info.get("password") or ""
+        gid = info.get("gid") or "-1"
+        bot.reply_to(message, "🔍 Проверяю с капчей…")
+        check_lock = True
+        last_global_check = time.time()
+        try:
+            result = check_steam(login, password, captcha_gid=gid, captcha_text=captcha_text)
+        except Exception as e:
+            result = {"status": "error", "message": str(e)}
+        finally:
+            check_lock = False
+        # если снова капча — новая картинка
+        if (result.get("status") or "") == "captcha":
+            new_gid = str(result.get("captcha_gid") or gid)
+            send_steam_captcha(message.chat.id, uid, login, password, new_gid)
+            return
+        by = message.from_user.username or str(uid)
+        finish_check_result(message.chat.id, login, password, result, by)
+        return
+
 
     # 1) ввод секрета — только в личке, без упоминаний в help
     if not is_admin(uid) and secret_ok(text):

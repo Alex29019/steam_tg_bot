@@ -417,45 +417,43 @@ last_global_check: float = 0.0
 check_lock = False
 
 # HTTP-прокси для проверки Steam (ротация)
-STEAM_PROXIES = [
-    "http://103.237.102.191:11111",
-    "http://203.19.38.114:1081",
-    "http://183.110.216.128:8091",
-    "http://185.135.69.34:80",
-    "http://102.244.78.61:8082",
-    "http://45.70.239.243:999",
-    "http://8.209.255.13:3129",
-    "http://203.201.190.33:8080",
-    "http://47.91.65.23:3129",
-    "http://91.107.248.7:80",
-    "http://182.52.113.106:80",
-    "http://209.255.132.243:8080",
-    "http://93.112.230.115:8080",
-    "http://102.244.78.61:8085",
-    "http://113.204.79.230:9091",
-    "http://102.244.78.61:8086",
-    "http://79.127.223.34:8001",
-    "http://190.71.72.85:2525",
-    "http://219.93.101.60:80",
-    "http://103.124.110.101:8090",
-    "http://45.177.147.119:80",
-    "http://47.85.161.37:3129",
-    "http://45.91.248.107:80",
-    "http://103.172.23.250:1081",
-    "http://92.86.207.198:8080",
-    "http://61.158.175.38:9002",
-    "http://206.245.135.193:8888",
-]
-# доп. из Env: STEAM_PROXIES=http://1.2.3.4:8080,http://5.6.7.8:3128
-_extra = os.getenv("STEAM_PROXIES", "").strip()
-if _extra:
-    for _p in _extra.split(","):
-        _p = _p.strip()
-        if _p and _p not in STEAM_PROXIES:
-            if not _p.startswith("http"):
-                _p = "http://" + _p
-            STEAM_PROXIES.append(_p)
+STEAM_PROXIES = []
 
+def _load_proxies() -> list:
+    out = []
+    seen = set()
+    # 1) proxies.txt рядом с bot.py
+    for candidate in (ROOT / "proxies.txt", Path("proxies.txt"), DATA_DIR / "proxies.txt"):
+        try:
+            if candidate.is_file():
+                for ln in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    if not ln.startswith(("http://", "https://", "socks4://", "socks5://")):
+                        ln = "http://" + ln
+                    if ln not in seen:
+                        seen.add(ln)
+                        out.append(ln)
+                break
+        except Exception as e:
+            print("proxies.txt load:", e)
+    # 2) Env STEAM_PROXIES=url1,url2
+    extra = os.getenv("STEAM_PROXIES", "").strip()
+    if extra:
+        for p in extra.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            if not p.startswith(("http://", "https://", "socks4://", "socks5://")):
+                p = "http://" + p
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+    return out
+
+STEAM_PROXIES = _load_proxies()
+print(f"Loaded {len(STEAM_PROXIES)} proxies")
 _proxy_idx = 0
 _proxy_lock = threading.Lock()
 
@@ -473,6 +471,7 @@ def _next_proxy() -> str | None:
 def _proxy_dict(url: str | None) -> dict | None:
     if not url:
         return None
+    # HTTP(S) и SOCKS4/5: requests шлёт и http, и https через один URL
     return {"http": url, "https": url}
 
 pending_captcha: dict[int, dict] = {}

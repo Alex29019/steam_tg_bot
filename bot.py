@@ -381,6 +381,7 @@ BANS_FILE = DATA_DIR / "banned_users.json"
 FAV_FILE = DATA_DIR / "favorites.json"  # uid -> [{l,p,g}]
 REQUESTS_FILE = DATA_DIR / "game_requests.json"  # list of requests
 CHECK_STATUS_FILE = DATA_DIR / "check_status.json"  # login -> status
+GIVEAWAY_FILE = DATA_DIR / "giveaway.json"  # текущий розыгрыш и победители
 CHECK_COOLDOWN = 60  # глобально: 1 проверка в минуту на весь бот
 print(f"DATA_DIR={DATA_DIR}")
 PAGE_SIZE = 10
@@ -482,6 +483,7 @@ admin_sessions: set[int] = set()
 admin_wait: dict[int, str] = {}
 # uid -> set of chat_ids selected for action
 admin_selected: dict[int, set[int]] = {}
+giveaway_lock = threading.RLock()
 chat_title_cache: dict[int, str] = {}
 
 
@@ -1169,6 +1171,52 @@ def show_menu(
         bot.send_message(chat_id, title, reply_markup=kb)
 
 
+
+def load_giveaway() -> dict:
+    data = load_json(GIVEAWAY_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    data.setdefault("active", False)
+    data.setdefault("code", "")
+    data.setdefault("limit", 0)
+    data.setdefault("prize_text", "")
+    data.setdefault("winners", [])
+    return data
+
+
+def save_giveaway(data: dict) -> None:
+    save_json(GIVEAWAY_FILE, data)
+
+
+def giveaway_status_text() -> str:
+    data = load_giveaway()
+    if not data.get("active"):
+        return "Розыгрыш: <b>не активен</b>"
+    winners = data.get("winners") or []
+    limit = int(data.get("limit") or 0)
+    return f"Розыгрыш: <b>активен</b>\nПолучили приз: <b>{len(winners)}/{limit}</b>"
+
+
+def notify_giveaway_admins(user, winner_number: int, limit: int) -> None:
+    username = getattr(user, "username", None)
+    uid = int(getattr(user, "id", 0) or 0)
+    first_name = getattr(user, "first_name", "") or ""
+    username_text = f"@{username}" if username else "не указан"
+    notice = (
+        "🎁 <b>Новый участник розыгрыша!</b>\n\n"
+        f"Юзер: <b>{esc(first_name)}</b>\n"
+        f"Username: <b>{esc(username_text)}</b>\n"
+        f"ID: <code>{uid}</code>\n"
+        f"Место: <b>{winner_number}/{limit}</b>"
+    )
+    recipients = set(_ADMIN_IDS) | set(admin_sessions)
+    for admin_id in recipients:
+        try:
+            bot.send_message(admin_id, notice)
+        except Exception as e:
+            print(f"giveaway admin notify failed {admin_id}: {e}")
+
+
 def admin_kb() -> types.InlineKeyboardMarkup:
     s = load_settings()
     mins = int(s.get("reminder_interval_min") or 30)
@@ -1182,6 +1230,7 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton(f"🔔 Авто: {on}", callback_data="adm:toggle"))
     kb.add(types.InlineKeyboardButton("📤 Авто-текст в выбранные", callback_data="adm:test"))
     kb.add(types.InlineKeyboardButton("👥 Отметить людей", callback_data="adm:mention"))
+    kb.add(types.InlineKeyboardButton("🎁 Создать розыгрыш", callback_data="adm:giveaway"))
     kb.add(types.InlineKeyboardButton("🚫 Забанить", callback_data="adm:ban"))
     kb.add(types.InlineKeyboardButton("✅ Разбанить", callback_data="adm:unban"))
     kb.add(types.InlineKeyboardButton("📋 Список банов", callback_data="adm:banlist"))
@@ -1198,6 +1247,7 @@ def admin_panel_text() -> str:
         f"Чатов в базе: <b>{len(chats)}</b>\n"
         f"Авто-сообщения: <b>{'вкл' if s.get('reminders_enabled', True) else 'выкл'}</b>\n"
         f"Интервал: <b>{int(s.get('reminder_interval_min') or 30)}</b> мин\n\n"
+        f"{giveaway_status_text()}\n\n"
         "1) Выбери чаты\n"
         "2) Рассылка или авто-текст\n"
         "Если чата нет в списке — напиши /accfree в той группе.\n\n"
@@ -1282,7 +1332,8 @@ def cmd_start(message: types.Message):
         "<b>/random</b> - случайный аккаунт\n"
         "<b>/random шутер</b> - по жанру (гонка, хоррор, рпг…)\n"
         "<b>/избранное</b> - только в личке\n"
-        "<b>/заявка игра</b> - запрос на добавление\n\n"
+        "<b>/заявка игра</b> - запрос на добавление\n"
+        "<b>/подарок КОД</b> - получить приз в активном розыгрыше\n\n"
         "Работает в личке и в группах.",
     )
 
@@ -1935,6 +1986,17 @@ def on_callback(cq: types.CallbackQuery):
 
 
 
+        if action == "giveaway":
+            admin_wait[uid] = "giveaway_code"
+            bot.answer_callback_query(cq.id)
+            bot.send_message(
+                chat_id,
+                "🎁 <b>Создание розыгрыша — шаг 1/3</b>\n\n"
+                "Пришли кодовое слово. Участники будут вводить его так: "
+                "<code>/подарок КОД</code>\nОтмена: /cancel",
+            )
+            return
+
         if action == "ban":
             admin_wait[uid] = "ban_user"
             bot.answer_callback_query(cq.id)
@@ -2294,6 +2356,73 @@ def on_callback(cq: types.CallbackQuery):
     bot.answer_callback_query(cq.id)
 
 
+@bot.message_handler(commands=["подарок", "Подарок", "gift"])
+def cmd_giveaway(message: types.Message):
+    if reject_if_banned(message):
+        return
+    user = message.from_user
+    if not user:
+        return
+    index_user(user)
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "Использование: <code>/подарок КОДОВОЕ_СЛОВО</code>")
+        return
+    entered_code = parts[1].strip().split()[0]
+
+    with giveaway_lock:
+        giveaway = load_giveaway()
+        if not giveaway.get("active"):
+            bot.reply_to(message, "Сейчас активного розыгрыша нет.")
+            return
+        correct_code = str(giveaway.get("code") or "")
+        if entered_code.casefold() != correct_code.casefold():
+            bot.reply_to(message, "❌ Неверное кодовое слово.")
+            return
+        winners = giveaway.get("winners")
+        if not isinstance(winners, list):
+            winners = []
+        uid = int(user.id)
+        if any(int(item.get("uid", 0)) == uid for item in winners if isinstance(item, dict)):
+            bot.reply_to(message, "Ты уже участвовал в этом розыгрыше.")
+            return
+        limit = int(giveaway.get("limit") or 0)
+        if limit <= 0 or len(winners) >= limit:
+            giveaway["active"] = False
+            save_giveaway(giveaway)
+            bot.reply_to(message, "🎁 Все призы уже разобраны.")
+            return
+        winner_number = len(winners) + 1
+        winners.append({
+            "uid": uid,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "at": int(time.time()),
+        })
+        giveaway["winners"] = winners
+        if len(winners) >= limit:
+            giveaway["active"] = False
+        save_giveaway(giveaway)
+        prize_text = str(giveaway.get("prize_text") or "")
+
+    # Сначала пробуем отправить приз участнику в личку. Если он ещё не запускал
+    # бота или запретил сообщения, отправляем приз ответом в текущем чате.
+    try:
+        bot.send_message(user.id, prize_text, parse_mode=None)
+    except Exception as private_error:
+        print(f"giveaway private prize send failed for {user.id}: {private_error}")
+        try:
+            bot.send_message(
+                message.chat.id,
+                prize_text,
+                parse_mode=None,
+                reply_to_message_id=message.message_id,
+            )
+        except Exception as chat_error:
+            print(f"giveaway chat prize send failed for {user.id}: {chat_error}")
+    notify_giveaway_admins(user, winner_number, limit)
+
+
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message: types.Message):
     admin_wait.pop(message.from_user.id, None)
@@ -2510,6 +2639,62 @@ def on_private_text(message: types.Message):
     # 2) шаги админки
     if is_admin(uid) and uid in admin_wait:
         step = admin_wait.pop(uid)
+        if step == "giveaway_code":
+            code = text.strip()
+            if not code or len(code) > 64 or any(ch.isspace() or ch == ":" for ch in code):
+                bot.reply_to(message, "Код должен быть одним словом длиной до 64 символов.")
+                admin_wait[uid] = "giveaway_code"
+                return
+            admin_wait[uid] = f"giveaway_count:{code}"
+            bot.reply_to(message, "🎁 <b>Шаг 2/3</b>\nСколько первых участников получат приз? Введи число от 1 до 10000.")
+            return
+        if step.startswith("giveaway_count:"):
+            code = step.split(":", 1)[1]
+            try:
+                count = int(text)
+                if count < 1 or count > 10000:
+                    raise ValueError()
+            except Exception:
+                bot.reply_to(message, "Введи целое число от 1 до 10000.")
+                admin_wait[uid] = step
+                return
+            admin_wait[uid] = f"giveaway_prize:{code}:{count}"
+            bot.reply_to(message, "🎁 <b>Шаг 3/3</b>\nПришли текст, который бот отправит победителю.")
+            return
+        if step.startswith("giveaway_prize:"):
+            parts = step.split(":", 2)
+            code = parts[1]
+            try:
+                count = int(parts[2])
+            except Exception:
+                bot.reply_to(message, "Ошибка шага. Начни создание розыгрыша заново.")
+                return
+            prize_text = text.strip()
+            if not prize_text:
+                bot.reply_to(message, "Текст приза не может быть пустым.")
+                admin_wait[uid] = step
+                return
+            with giveaway_lock:
+                giveaway = {
+                    "active": True,
+                    "code": code,
+                    "limit": count,
+                    "prize_text": prize_text,
+                    "winners": [],
+                    "created_by": uid,
+                    "created_at": int(time.time()),
+                }
+                save_giveaway(giveaway)
+            bot.reply_to(
+                message,
+                "✅ <b>Розыгрыш создан!</b>\n\n"
+                f"Код: <code>{esc(code)}</code>\n"
+                f"Количество призов: <b>{count}</b>\n\n"
+                f"Участники вводят: <code>/подарок {esc(code)}</code>\n"
+                "Первые участники получат приз автоматически.",
+                reply_markup=admin_kb(),
+            )
+            return
         if step == "mention_count":
             raw = text.strip().lower()
             if raw in ("all", "все", "0", "-1"):

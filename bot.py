@@ -2358,6 +2358,10 @@ def on_callback(cq: types.CallbackQuery):
 
 @bot.message_handler(commands=["подарок", "Подарок", "gift"])
 def cmd_giveaway(message: types.Message):
+    # Розыгрыш доступен только в личном чате с ботом.
+    # В группах и супергруппах команда полностью игнорируется без ответа.
+    if not message.chat or message.chat.type != "private":
+        return
     if reject_if_banned(message):
         return
     user = message.from_user

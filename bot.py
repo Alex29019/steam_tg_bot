@@ -21,294 +21,10 @@ from flask import Flask, request
 from telebot import types
 
 
-# ===== Steam check (inlined) =====
-import base64
-from typing import Any as _Any
 
-try:
-    from Crypto.Cipher import PKCS1_v1_5
-    from Crypto.PublicKey import RSA
-    _CRYPTO_OK = True
-except Exception as _ce:
-    print("Crypto import fail:", _ce)
-    _CRYPTO_OK = False
-
-def _der_length(n: int) -> bytes:
-    if n < 128:
-        return bytes([n])
-    b = []
-    while n:
-        b.insert(0, n & 0xFF)
-        n >>= 8
-    return bytes([0x80 | len(b), *b])
-
-def _der_tag(tag: int, content: bytes) -> bytes:
-    return bytes([tag]) + _der_length(len(content)) + content
-
-def _der_int(buf: bytes) -> bytes:
-    if buf and (buf[0] & 0x80):
-        buf = b"\x00" + buf
-    return _der_tag(0x02, buf)
-
-def build_rsa_pem(mod_hex: str, exp_hex: str) -> bytes:
-    mod = bytes.fromhex(mod_hex)
-    exp = bytes.fromhex(exp_hex)
-    rsa_key = _der_tag(0x30, _der_int(mod) + _der_int(exp))
-    alg = _der_tag(0x30, _der_tag(0x06, bytes.fromhex("2a864886f70d010101")) + _der_tag(0x05, b""))
-    spki = _der_tag(0x30, alg + _der_tag(0x03, b"\x00" + rsa_key))
-    b64 = base64.b64encode(spki).decode()
-    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
-    return ("-----BEGIN PUBLIC KEY-----\n" + "\n".join(lines) + "\n-----END PUBLIC KEY-----").encode()
-
-def encrypt_password(password: str, mod_hex: str, exp_hex: str) -> str:
-    key = RSA.import_key(build_rsa_pem(mod_hex, exp_hex))
-    enc = PKCS1_v1_5.new(key).encrypt(password.encode("utf-8"))
-    return base64.b64encode(enc).decode()
-
-_STEAM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-
-
-
-def _new_steam_session(proxy_url: str | None = None):
-    import requests as _req
-    session = _req.Session()
-    session.trust_env = False
-    session.headers.update({
-        "User-Agent": _STEAM_UA,
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Origin": "https://steamcommunity.com",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    return session
-
-
-
-def check_steam(
-    username: str,
-    password: str,
-    captcha_gid: str = "-1",
-    captcha_text: str = "",
-    session=None,
-) -> dict:
-    """session — та же, что грузила капчу (иначе Steam отклоняет верный ввод)."""
-    if not _CRYPTO_OK:
-        return {"status": "error", "message": "На сервере нет pycryptodome (добавь в requirements.txt)"}
-    try:
-        import requests as _req
-    except Exception:
-        return {"status": "error", "message": "На сервере нет requests"}
-
-    own_session = session is None
-    if session is None:
-        session = _new_steam_session()
-
-    headers = {
-        "User-Agent": _STEAM_UA,
-        "Referer": "https://steamcommunity.com/login/home/?goto=",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Origin": "https://steamcommunity.com",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    try:
-        r = session.get(
-            "https://steamcommunity.com/login/getrsakey",
-            params={"username": username, "donotcache": int(time.time() * 1000)},
-            headers=headers,
-            timeout=20,
-        )
-        rsa = r.json()
-    except Exception as e:
-        return {"status": "error", "message": f"Ошибка сети (RSA): {e}"}
-
-    if not rsa or not rsa.get("success"):
-        return {"status": "error", "message": "Аккаунт не работает"}
-
-    try:
-        enc_pass = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
-    except Exception as e:
-        return {"status": "error", "message": f"Ошибка шифрования: {e}"}
-
-    payload = {
-        "username": username,
-        "password": enc_pass,
-        "twofactorcode": "",
-        "emailauth": "",
-        "loginfriendlyname": "",
-        "captchagid": str(captcha_gid or "-1"),
-        "captcha_text": captcha_text or "",
-        "emailsteamid": "",
-        "rsatimestamp": rsa["timestamp"],
-        "remember_login": "false",
-        "donotcache": str(int(time.time() * 1000)),
-    }
-    try:
-        r = session.post(
-            "https://steamcommunity.com/login/dologin/",
-            data=payload,
-            headers={
-                **headers,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Referer": "https://steamcommunity.com/login/home/?goto=",
-            },
-            timeout=20,
-        )
-        data = r.json()
-    except Exception as e:
-        return {"status": "error", "message": f"Ошибка сети (login): {e}"}
-
-    if isinstance(data, str):
-        return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
-    if not isinstance(data, dict):
-        return {"status": "error", "message": "Аккаунт не работает"}
-
-    if data.get("success") is True:
-        return {"status": "success", "message": "Аккаунт работает"}
-
-    if data.get("requires_twofactor") or data.get("emailauth_needed") or data.get("emailsteamid"):
-        return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
-
-    msg_raw = str(data.get("message") or data.get("strError") or "")
-    msg = msg_raw.lower()
-    captcha_fail_hints = (
-        "captcha",
-        "human",
-        "characters you entered",
-        "did not match",
-        "verify your humanity",
-        "recaptcha",
-    )
-    need_captcha = bool(data.get("captcha_needed")) or any(h in msg for h in captcha_fail_hints)
-    if need_captcha:
-        gid = str(data.get("captcha_gid") or captcha_gid or "-1")
-        if captcha_text:
-            return {
-                "status": "captcha",
-                "message": "Капча неверная или устарела — введи с новой картинки",
-                "captcha_gid": gid,
-                "session": session,
-            }
-        return {
-            "status": "captcha",
-            "message": "Требуется капча",
-            "captcha_gid": gid,
-            "session": session,
-        }
-
-    if "too many" in msg or "rate" in msg:
-        return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
-
-    # при уже введённой капче не доверяем голому "incorrect password" с datacenter IP
-    if captcha_text:
-        gid = str(data.get("captcha_gid") or captcha_gid or "-1")
-        if data.get("captcha_needed") or data.get("captcha_gid"):
-            return {
-                "status": "captcha",
-                "message": "Steam отклонил капчу — новая картинка",
-                "captcha_gid": gid,
-                "session": session,
-            }
-
-    detail = msg_raw.strip() or "Аккаунт не работает"
-    return {"status": "error", "message": detail[:200]}
-
-
-# ===== end steam check =====
-
-def start_fresh_captcha_challenge(login: str, password: str) -> dict:
-    """Новая сессия + логин без капчи → свежий captcha_gid от Steam."""
-    session = _new_steam_session()
-    result = check_steam(login, password, captcha_gid="-1", captcha_text="", session=session)
-    if result.get("status") == "captcha":
-        result["session"] = result.get("session") or session
-        return result
-    # иногда Steam сразу ok / fail без капчи
-    result["session"] = session
-    return result
-
-
-
-
-    """Капча в той же Session, что и логин."""
-    from io import BytesIO
-
-    gid = str(gid or "-1")
-    if session is None:
-        session = captcha_sessions.get(uid) or _new_steam_session()
-    captcha_sessions[uid] = session
-
-    pending_captcha[uid] = {
-        "login": login,
-        "password": password,
-        "gid": gid,
-        "chat_id": chat_id,
-    }
-    url = f"https://steamcommunity.com/login/rendercaptcha/?gid={gid}"
-    try:
-        r = session.get(
-            url,
-            headers={
-                "User-Agent": _STEAM_UA,
-                "Referer": "https://steamcommunity.com/login/home/?goto=",
-            },
-            timeout=20,
-        )
-        if r.status_code != 200 or not r.content:
-            bot.send_message(
-                chat_id,
-                "⚠️ Steam запросил капчу, но картинку получить не удалось.\n"
-                "Попробуй /проверка ещё раз через минуту.",
-            )
-            return
-        bio = BytesIO(r.content)
-        bio.name = "captcha.png"
-        caption = (
-            "⚠️ <b>Steam просит капчу</b>\n\n"
-            f"Логин: <code>{esc(login)}</code>\n\n"
-            "Пришли <b>текст с картинки</b> одним сообщением.\n\n"
-            "Вот пример ответа на капчу:\n"
-            "<code>Ueu@cv</code>\n\n"
-            "(Первая буква большая, а другие маленькие, "
-            "<b>ОБЯЗАТЕЛЬНО ПИСАТЬ ИМЕННО ТАК</b>)\n\n"
-            "Отмена: /cancel"
-        )
-        bot.send_photo(
-            chat_id,
-            bio,
-            caption=caption,
-            parse_mode="HTML",
-            reply_to_message_id=reply_to,
-        )
-    except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Капча нужна, ошибка загрузки: {esc(str(e))}")
-
-
-def finish_check_result(chat_id: int, login: str, password: str, result: dict, by: str, idx: int | None = None, found_list: list | None = None) -> None:
-    st = result.get("status") or "error"
-    msg = result.get("message") or ""
-    if st == "success":
-        if "2fa" in msg.lower() or "guard" in msg.lower():
-            set_check_result(login, "fail", msg, by=by)
-            mark = "❌ <b>Не работает</b> (Steam Guard / 2FA)"
-        else:
-            set_check_result(login, "ok", msg, by=by)
-            mark = "✅ <b>Работает</b>"
-        result = {"status": "error", "message": result.get("message") or "Steam risk — прокси"}
-        mark = "⚠️ <b>Нужна капча</b>"
-    else:
-        set_check_result(login, "fail", msg, by=by)
-        mark = "❌ <b>Не работает</b>"
-    from datetime import datetime, timezone, timedelta
-    at = datetime.now(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
-    body = (
-        f"{mark}\n\n"
-        f"👤 <code>{esc(login)}</code>\n"
-        f"📝 {esc(msg)}\n"
-        f"📅 {at}"
-    )
-    if found_list is not None and idx is not None and 0 <= idx < len(found_list):
-        body = fmt_acc(found_list[idx], idx + 1)
-    bot.send_message(chat_id, body)
+# Steam account check REMOVED
+def check_steam(*a, **k):
+    return {"status": "error", "message": "Проверка аккаунта отключена"}
 
 
 
@@ -370,26 +86,62 @@ last_global_check: float = 0.0
 check_lock = False
 
 # HTTP-прокси для проверки Steam (ротация)
-STEAM_PROXIES = []  # proxies removed
+STEAM_PROXIES = []
+
+def _load_proxies() -> list:
+    out = []
+    seen = set()
+    # 1) proxies.txt рядом с bot.py
+    for candidate in (ROOT / "proxies.txt", Path("proxies.txt"), DATA_DIR / "proxies.txt"):
+        try:
+            if candidate.is_file():
+                for ln in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    if not ln.startswith(("http://", "https://", "socks4://", "socks5://")):
+                        ln = "http://" + ln
+                    if ln not in seen:
+                        seen.add(ln)
+                        out.append(ln)
+                break
+        except Exception as e:
+            print("proxies.txt load:", e)
+    # 2) Env STEAM_PROXIES=url1,url2
+    extra = os.getenv("STEAM_PROXIES", "").strip()
+    if extra:
+        for p in extra.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            if not p.startswith(("http://", "https://", "socks4://", "socks5://")):
+                p = "http://" + p
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+    return out
+
+STEAM_PROXIES = _load_proxies()
+print(f"Loaded {len(STEAM_PROXIES)} proxies")
+_proxy_idx = 0
+_proxy_lock = threading.Lock()
 
 
-# ===== CAPTCHA-FREE OVERRIDE =====
-try:
-    from steam_check_sync import check_steam as _check_steam_noca
-    def check_steam(username, password, captcha_gid="-1", captcha_text="", session=None, proxy_url=None):
-        # no captcha, no proxies
-        kwargs = {}
-        if session is not None:
-            kwargs["session"] = session
-        r = _check_steam_noca(username, password, **kwargs)
-        if isinstance(r, dict) and r.get("status") == "captcha":
-            return {"status": "error", "message": r.get("message") or "Steam блок IP"}
-        return r
-    print("steam_check: captcha-free override ON")
-except Exception as _e:
-    print("steam_check override fail:", _e)
-# ===== END OVERRIDE =====
+def _next_proxy() -> str | None:
+    global _proxy_idx
+    if not STEAM_PROXIES:
+        return None
+    with _proxy_lock:
+        p = STEAM_PROXIES[_proxy_idx % len(STEAM_PROXIES)]
+        _proxy_idx += 1
+        return p
 
+
+def _proxy_dict(url: str | None) -> dict | None:
+    if not url:
+        return None
+    # HTTP(S) и SOCKS4/5: requests шлёт и http, и https через один URL
+    return {"http": url, "https": url}
 
 pending_captcha: dict[int, dict] = {}
 captcha_sessions: dict[int, object] = {}  # uid -> requests.Session
@@ -930,6 +682,8 @@ def get_check_mark(login: str) -> str:
         line = f"❌ <b>Не работает</b>"
     elif status == "2fa":
         line = f"❌ <b>Не работает (Steam Guard / 2FA)</b>"
+    elif status == "captcha":
+        line = f"⚠️ <b>Нужна капча</b> (не проверено до конца)"
     else:
         line = f"ℹ️ {esc(st.get('message') or status)}"
     extra = []
@@ -1028,8 +782,6 @@ def add_game_request(uid: int, username: str, game: str) -> None:
 
 def acc_kb_private(idx: int, page: int, in_fav: bool = False, with_check: bool = True) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
-    if with_check:
-        kb.add(types.InlineKeyboardButton("🔍 Проверить", callback_data=f"chk:{idx}:{page}"))
     if not in_fav:
         kb.add(types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fv:{idx}:{page}"))
     else:
@@ -1039,7 +791,6 @@ def acc_kb_private(idx: int, page: int, in_fav: bool = False, with_check: bool =
 
 def acc_kb_public(idx: int, page: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔍 Проверить", callback_data=f"chk:{idx}:{page}"))
     return kb
 
 
@@ -1075,7 +826,6 @@ def show_menu(
             f"⭐ <code>/избранное</code> — избранное (только личка)\n"
             f"🎮 <code>/заявка название</code> — запрос игры\n"
             f"🛠 <code>/обход</code> — обход лаунчеров (Rockstar, Ubisoft, EA…)\n"
-            f"🔍 Кнопка «Проверить» — 1 раз в минуту на весь бот"
         )
     )
     kb = page_kb(key, 0)
@@ -1255,7 +1005,7 @@ def cmd_start(message: types.Message):
 
 @bot.message_handler(commands=["obhod", "обход", "bypass"])
 def cmd_obhod(message: types.Message):
-    """Ссылки на обходы — кликабельный текст."""
+    """Выдать архив обхода лаунчеров (Rockstar, Ubisoft, EA и т.д.)."""
     if reject_if_banned(message):
         return
     index_user(message.from_user)
@@ -1271,15 +1021,86 @@ def cmd_obhod(message: types.Message):
         remember_chat(message.chat.id, message.chat.type)
         remember_user(message.chat.id, message.from_user)
 
-    msg = (
+    caption = (
         "🛠 <b>Обход лаунчеров</b>\n"
         "Rockstar / Ubisoft / EA и др.\n\n"
-        '<a href="https://github.com/onajlikezz/Nightlight-Launcher/releases/download/NLLauncherV5.3.00/Nightlight.Launcher.Setup.5.3.0.exe">Обход 1</a>\n'
-        '<a href="https://t.me/MirArenDaff2/16357">Обход 2</a>\n'
-        '<a href="https://github.com/LightnigFast/Project-Lightning/releases/download/v5.0.11.0/ProjectLightningInstaller-v5.exe">Обход 3</a>\n\n'
-        "Нажми на текст — откроется ссылка."
+        "Скачай архив и следуй инструкции внутри."
     )
-    bot.reply_to(message, msg, disable_web_page_preview=True)
+
+    # 1) Готовый file_id (после одной ручной загрузки через @BotFather/локальный API)
+    if BYPASS_FILE_ID:
+        try:
+            bot.send_document(
+                message.chat.id,
+                BYPASS_FILE_ID,
+                caption=caption,
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        except Exception as e:
+            bot.reply_to(message, f"Не удалось отправить по file_id: {esc(str(e))}")
+            return
+
+    # 2) Локальный файл — только если < 49 MB (лимит Bot API)
+    if BYPASS_ZIP_PATH:
+        p = Path(BYPASS_ZIP_PATH)
+        if p.is_file():
+            size = p.stat().st_size
+            if size <= 49 * 1024 * 1024:
+                wait = bot.reply_to(message, "⏳ Отправляю файл…")
+                try:
+                    with open(p, "rb") as f:
+                        bot.send_document(
+                            message.chat.id,
+                            f,
+                            caption=caption,
+                            parse_mode="HTML",
+                            visible_file_name=p.name,
+                        )
+                    try:
+                        bot.delete_message(message.chat.id, wait.message_id)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    bot.reply_to(message, f"Ошибка отправки: {esc(str(e))}")
+                return
+            # слишком большой — только ссылка
+            if BYPASS_DOWNLOAD_URL:
+                bot.reply_to(
+                    message,
+                    caption + "\n\n"
+                    f"📦 Файл большой ({size // (1024*1024)} МБ), Telegram-бот не шлёт >50 МБ.\n"
+                    f"Скачай по ссылке:\n{BYPASS_DOWNLOAD_URL}",
+                )
+                return
+            bot.reply_to(
+                message,
+                caption + "\n\n"
+                f"Файл на сервере {size // (1024*1024)} МБ, лимит бота 50 МБ.\n"
+                "Укажи в Env <code>BYPASS_DOWNLOAD_URL</code> со ссылкой на скачивание.",
+            )
+            return
+        bot.reply_to(message, "BYPASS_ZIP_PATH указан, но файл не найден.")
+        return
+
+    # 3) Только ссылка
+    if BYPASS_DOWNLOAD_URL:
+        bot.reply_to(
+            message,
+            caption + "\n\n"
+            f"📥 Скачать (~400 МБ):\n{BYPASS_DOWNLOAD_URL}",
+        )
+        return
+
+    bot.reply_to(
+        message,
+        "🛠 Обход лаунчеров пока не настроен.\n\n"
+        "Админ: в Render Env добавь один из вариантов:\n"
+        "• <code>BYPASS_DOWNLOAD_URL</code> — прямая ссылка на zip (для ~400 МБ)\n"
+        "• <code>BYPASS_FILE_ID</code> — если файл уже залит в Telegram\n"
+        "• <code>BYPASS_ZIP_PATH</code> — путь к файлу &lt; 50 МБ",
+    )
 
 
 @bot.message_handler(commands=["accfree"])
@@ -1446,69 +1267,6 @@ def cmd_request(message: types.Message):
     )
 
 
-
-@bot.message_handler(commands=["проверка", "proverka", "check"])
-def cmd_proverka(message: types.Message):
-    """ /проверка логин пароль """
-    global last_global_check, check_lock
-    if reject_if_banned(message):
-        return
-    index_user(message.from_user)
-    uid = message.from_user.id
-
-    raw = (message.text or "").strip()
-    # /проверка@Bot login pass
-    parts = raw.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(
-            message,
-            "🔍 Проверка аккаунта Steam\n\n"
-            "Формат:\n<code>/проверка логин пароль</code>\n\n"
-            "Пример:\n<code>/проверка Kdemwkxk cowldlcls</code>\n\n"
-            "Лимит: 1 проверка в минуту на весь бот.",
-        )
-        return
-
-    rest = parts[1].strip()
-    # login password (password may contain spaces? take first token login, rest password)
-    bits = rest.split(maxsplit=1)
-    if len(bits) < 2:
-        bot.reply_to(
-            message,
-            "Нужны логин и пароль через пробел.\n"
-            "<code>/проверка логин пароль</code>",
-        )
-        return
-    login, password = bits[0].strip(), bits[1].strip()
-    if not login or not password:
-        bot.reply_to(message, "Пустой логин или пароль.")
-        return
-
-    now = time.time()
-    left = int(CHECK_COOLDOWN - (now - last_global_check))
-    if left > 0:
-        bot.reply_to(
-            message,
-            f"⏳ Проверка занята. Подожди <b>{left}</b> сек. (1 раз в минуту)",
-        )
-        return
-    if check_lock:
-        bot.reply_to(message, "⏳ Уже идёт проверка, подожди.")
-        return
-
-    check_lock = True
-    last_global_check = now
-    bot.reply_to(message, f"🔍 Проверяю <code>{esc(login)}</code>…")
-    try:
-        result = check_steam(login, password)
-    except Exception as e:
-        result = {"status": "error", "message": str(e)}
-    finally:
-        check_lock = False
-
-    by = (message.from_user.username or str(uid)) if message.from_user else str(uid)
-    st = result.get("status") or "error"
-    finish_check_result(message.chat.id, login, password, result, by)
 
 
 @bot.message_handler(commands=["auth"])
@@ -2089,102 +1847,8 @@ def on_callback(cq: types.CallbackQuery):
         return
 
 
-    if data.startswith("chk:"):
-        global last_global_check, check_lock
-        parts = data.split(":")
-        try:
-            idx = int(parts[1])
-            page = int(parts[2]) if len(parts) > 2 else 0
-        except Exception:
-            bot.answer_callback_query(cq.id)
-            return
-        if idx < 0 or idx >= len(found):
-            bot.answer_callback_query(cq.id, "Открой аккаунт снова", show_alert=True)
-            return
-        now = time.time()
-        left = int(CHECK_COOLDOWN - (now - last_global_check))
-        if left > 0:
-            bot.answer_callback_query(
-                cq.id,
-                f"Проверка занята. Подожди {left} сек. (1 раз в минуту)",
-                show_alert=True,
-            )
-            return
-        if check_lock:
-            bot.answer_callback_query(cq.id, "Уже идёт проверка, подожди", show_alert=True)
-            return
-        a = found[idx]
-        login = a.get("l") or ""
-        password = a.get("p") or ""
-        if not login or not password:
-            bot.answer_callback_query(cq.id, "Нет данных", show_alert=True)
-            return
-        check_lock = True
-        last_global_check = now
-        bot.answer_callback_query(cq.id, "Проверяю…")
-        try:
-            bot.send_message(chat_id, f"🔍 Проверяю <code>{esc(login)}</code>…")
-        except Exception:
-            pass
-        try:
-            result = check_steam(login, password)
-        except Exception as e:
-            result = {"status": "error", "message": str(e)}
-        finally:
-            check_lock = False
-        by = (cq.from_user.username or str(uid)) if cq.from_user else str(uid)
-        st = result.get("status") or "error"
-        finish_check_result(chat_id, login, password, result, by, idx=idx, found_list=found)
-        return
-
-    # добавить в избранное (только личка)
-    if data.startswith("fv:"):
-        if not cq.message or cq.message.chat.type != "private":
-            bot.answer_callback_query(cq.id, "Только в личке", show_alert=True)
-            return
-        parts = data.split(":")
-        try:
-            idx = int(parts[1])
-        except Exception:
-            bot.answer_callback_query(cq.id)
-            return
-        if idx < 0 or idx >= len(found):
-            bot.answer_callback_query(cq.id, "Открой список снова", show_alert=True)
-            return
-        ok, msg = add_favorite(uid, found[idx])
-        bot.answer_callback_query(cq.id, msg, show_alert=True)
-        return
-
-    if data.startswith("fu:"):
-        if not cq.message or cq.message.chat.type != "private":
-            bot.answer_callback_query(cq.id, "Только в личке", show_alert=True)
-            return
-        parts = data.split(":")
-        try:
-            idx = int(parts[1])
-        except Exception:
-            bot.answer_callback_query(cq.id)
-            return
-        favs = get_user_favs(uid)
-        if idx < 0 or idx >= len(favs):
-            bot.answer_callback_query(cq.id, "Нет в избранном", show_alert=True)
-            return
-        login = favs[idx].get("l") or ""
-        if remove_favorite(uid, login):
-            bot.answer_callback_query(cq.id, "Убрано", show_alert=True)
-        else:
-            bot.answer_callback_query(cq.id, "Не найдено", show_alert=True)
-        return
-
-    bot.answer_callback_query(cq.id)
-
-
 @bot.message_handler(commands=["подарок", "Подарок", "gift"])
 def cmd_giveaway(message: types.Message):
-    # Розыгрыш доступен только в личном чате с ботом.
-    # В группах и супергруппах команда полностью игнорируется без ответа.
-    if not message.chat or message.chat.type != "private":
-        return
     if reject_if_banned(message):
         return
     user = message.from_user
@@ -2261,22 +1925,31 @@ def cmd_cancel(message: types.Message):
 
 
 @bot.message_handler(
-    func=lambda m: False,
-    content_types=["text"],
+    func=lambda m: bool(m.text)
+    and not (m.text or "").startswith("/")
+    and m.chat.type == "private"
 )
-def on_captcha_group(message: types.Message):
-    """Captcha input disabled — checks run without captcha."""
-    return
-
-
-
 def on_private_text(message: types.Message):
     index_user(message.from_user)
     uid = message.from_user.id
     text = (message.text or "").strip()
 
-    # captcha input removed — checks are captcha-free
+    # 1) ввод секрета — только в личке, без упоминаний в help
+    if not is_admin(uid) and secret_ok(text):
+        admin_sessions.add(uid)
+        save_admin_sessions()
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+        bot.send_message(
+            message.chat.id,
+            "✅ Доступ открыт.\nКоманда: /admin",
+            reply_markup=admin_kb(),
+        )
+        return
 
+    # 2) шаги админки
     if is_admin(uid) and uid in admin_wait:
         step = admin_wait.pop(uid)
         if step == "giveaway_code":

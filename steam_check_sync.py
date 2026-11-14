@@ -1,8 +1,7 @@
-"""Steam credential check WITHOUT captcha UI and WITHOUT proxies.
+"""Steam check without user captcha.
 
-Primary: IAuthenticationService/BeginAuthSessionViaCredentials
-Fallback: steamcommunity dologin with captchagid=-1
-Never returns status=captcha.
+Uses IAuthenticationService first (no captcha_gid), then dologin.
+If Steam forces captcha on this IP, returns clear error (not success).
 """
 from __future__ import annotations
 
@@ -58,26 +57,31 @@ def encrypt_password(password: str, mod_hex: str, exp_hex: str) -> str:
     return base64.b64encode(enc).decode()
 
 
-UA = (
+UA_DESKTOP = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+UA_MOBILE = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+)
 
 
-def _session() -> requests.Session:
+def _session(ua: str = UA_DESKTOP) -> requests.Session:
     s = requests.Session()
+    s.trust_env = False
     s.headers.update(
         {
-            "User-Agent": UA,
+            "User-Agent": ua,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
         }
     )
-    s.trust_env = False  # ignore env HTTP_PROXY / HTTPS_PROXY
     return s
 
 
 def _get_rsa(session: requests.Session, username: str) -> dict[str, Any] | None:
+    # community
     try:
         r = session.get(
             "https://steamcommunity.com/login/getrsakey",
@@ -86,44 +90,138 @@ def _get_rsa(session: requests.Session, username: str) -> dict[str, Any] | None:
                 "Referer": "https://steamcommunity.com/login/home/?goto=",
                 "Origin": "https://steamcommunity.com",
             },
-            timeout=15,
+            timeout=20,
         )
         data = r.json()
         if data and data.get("success"):
             return data
     except Exception:
         pass
+    # API
     try:
         r = session.get(
             "https://api.steampowered.com/IAuthenticationService/GetPasswordRSAPublicKey/v1/",
             params={"account_name": username},
-            timeout=15,
+            timeout=20,
         )
         data = r.json()
-        resp = data.get("response") or data
-        if resp.get("publickey_mod") and resp.get("publickey_exp"):
+        resp = (data.get("response") if isinstance(data, dict) else None) or data
+        if isinstance(resp, dict) and resp.get("publickey_mod") and resp.get("publickey_exp"):
             return {
                 "success": True,
                 "publickey_mod": resp["publickey_mod"],
                 "publickey_exp": resp["publickey_exp"],
-                "timestamp": resp.get("timestamp") or str(int(time.time())),
+                "timestamp": str(resp.get("timestamp") or int(time.time())),
             }
     except Exception:
         pass
     return None
 
 
-def _check_via_dologin(
-    session: requests.Session, username: str, password: str, rsa: dict
-) -> dict[str, Any]:
+def _auth_service(session: requests.Session, username: str, password: str, rsa: dict) -> dict[str, Any]:
     try:
-        enc_pass = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
+        enc = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
+    except Exception:
+        return {"status": "error", "message": "Аккаунт не работает"}
+
+    # try form fields (no protobuf)
+    form = {
+        "account_name": username,
+        "encrypted_password": enc,
+        "encryption_timestamp": str(rsa["timestamp"]),
+        "remember_login": "0",
+        "persistence": "1",
+        "website_id": "Community",
+        "device_friendly_name": "Chrome",
+        "platform_type": "2",
+        "guard_data": "",
+    }
+    headers = {
+        "Origin": "https://steamcommunity.com",
+        "Referer": "https://steamcommunity.com/",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    url = "https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaCredentials/v1/"
+
+    for body in (
+        form,
+        {"input_json": json.dumps({
+            "account_name": username,
+            "encrypted_password": enc,
+            "encryption_timestamp": str(rsa["timestamp"]),
+            "remember_login": False,
+            "platform_type": 2,
+            "persistence": 1,
+            "website_id": "Community",
+            "device_details": {"device_friendly_name": "Chrome", "platform_type": 2},
+        })},
+    ):
+        try:
+            r = session.post(url, data=body, headers=headers, timeout=20)
+            data = r.json() if r.content else {}
+        except Exception:
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        # Steam sometimes returns eresult at top level
+        eresult = data.get("eresult")
+        resp = data.get("response")
+        if resp is None and isinstance(data.get("client_id"), (str, int)):
+            resp = data
+        if not isinstance(resp, dict):
+            resp = {}
+
+        if eresult is None:
+            eresult = resp.get("eresult")
+
+        # 1 = OK
+        if resp.get("client_id") and (resp.get("request_id") or resp.get("steamid")):
+            conf = resp.get("allowed_confirmations") or []
+            # has confirmations → guard
+            if conf:
+                return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
+            # poll
+            try:
+                pr = session.post(
+                    "https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/",
+                    data={
+                        "client_id": str(resp["client_id"]),
+                        "request_id": str(resp.get("request_id") or ""),
+                    },
+                    headers=headers,
+                    timeout=20,
+                )
+                pdata = pr.json().get("response") or {}
+                if pdata.get("access_token") or pdata.get("refresh_token"):
+                    return {"status": "success", "message": "Аккаунт работает"}
+                if pdata.get("account_name"):
+                    return {"status": "success", "message": "Аккаунт работает"}
+            except Exception:
+                pass
+            # session began without explicit guard list
+            return {"status": "success", "message": "Аккаунт работает"}
+
+        # eresult codes: 5 invalid password, 84 rate limit, 101 failed, 63 login denied
+        if eresult in (5, 8, 15, 101):
+            return {"status": "error", "message": "Аккаунт не работает"}
+        if eresult == 84:
+            return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
+
+    return {"status": "error", "message": "auth_api_no_result"}
+
+
+def _dologin(session: requests.Session, username: str, password: str, rsa: dict) -> dict[str, Any]:
+    try:
+        enc = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
     except Exception:
         return {"status": "error", "message": "Аккаунт не работает"}
 
     payload = {
+        "donotcache": str(int(time.time() * 1000)),
         "username": username,
-        "password": enc_pass,
+        "password": enc,
         "twofactorcode": "",
         "emailauth": "",
         "loginfriendlyname": "",
@@ -132,7 +230,6 @@ def _check_via_dologin(
         "emailsteamid": "",
         "rsatimestamp": rsa["timestamp"],
         "remember_login": "false",
-        "donotcache": str(int(time.time() * 1000)),
     }
     try:
         r = session.post(
@@ -144,11 +241,11 @@ def _check_via_dologin(
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "X-Requested-With": "XMLHttpRequest",
             },
-            timeout=15,
+            timeout=20,
         )
         data = r.json()
-    except Exception:
-        return {"status": "error", "message": "Ошибка сети (login)"}
+    except Exception as e:
+        return {"status": "error", "message": f"Ошибка сети (login): {e}"}
 
     if isinstance(data, str):
         return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
@@ -161,83 +258,23 @@ def _check_via_dologin(
     if data.get("requires_twofactor") or data.get("emailauth_needed") or data.get("emailsteamid"):
         return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
 
+    msg = str(data.get("message") or data.get("strError") or "")
+    msg_l = msg.lower()
+
     if data.get("captcha_needed"):
-        return {"status": "error", "message": "Steam risk (капча отключена)"}
+        # sometimes still includes wrong-password text
+        if any(x in msg_l for x in ("incorrect", "invalid", "password", "неверн")):
+            return {"status": "error", "message": "Аккаунт не работает"}
+        return {
+            "status": "error",
+            "message": "Steam блокирует IP (нужен другой IP/хостинг)",
+        }
 
-    msg = str(data.get("message") or data.get("strError") or "").lower()
-    if "incorrect" in msg or "invalid" in msg or "password" in msg:
+    if "incorrect" in msg_l or "invalid" in msg_l or "password" in msg_l:
         return {"status": "error", "message": "Аккаунт не работает"}
-    if "too many" in msg or "rate" in msg:
+    if "too many" in msg_l or "rate" in msg_l:
         return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
-    return {"status": "error", "message": "Аккаунт не работает"}
 
-
-def _check_via_auth_service(
-    session: requests.Session, username: str, password: str, rsa: dict
-) -> dict[str, Any]:
-    try:
-        enc_pass = encrypt_password(password, rsa["publickey_mod"], rsa["publickey_exp"])
-    except Exception:
-        return {"status": "error", "message": "Аккаунт не работает"}
-
-    body = {
-        "account_name": username,
-        "encrypted_password": enc_pass,
-        "encryption_timestamp": rsa["timestamp"],
-        "remember_login": "false",
-        "platform_type": "2",
-        "persistence": "1",
-        "website_id": "Community",
-        "device_details": {
-            "device_friendly_name": "Chrome",
-            "platform_type": "2",
-        },
-    }
-    try:
-        r = session.post(
-            "https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaCredentials/v1/",
-            data={"input_json": json.dumps(body)},
-            timeout=15,
-        )
-        data = r.json()
-    except Exception:
-        return {"status": "error", "message": "Ошибка сети (auth api)"}
-
-    resp = data.get("response") if isinstance(data, dict) else None
-    if not isinstance(resp, dict):
-        return {"status": "error", "message": "Аккаунт не работает"}
-
-    if resp.get("client_id") and resp.get("request_id"):
-        try:
-            poll = session.post(
-                "https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/",
-                data={
-                    "input_json": json.dumps(
-                        {
-                            "client_id": resp["client_id"],
-                            "request_id": resp["request_id"],
-                        }
-                    )
-                },
-                timeout=15,
-            )
-            pdata = poll.json().get("response") or {}
-            if pdata.get("access_token") or pdata.get("refresh_token"):
-                return {"status": "success", "message": "Аккаунт работает"}
-            if pdata.get("account_name") or resp.get("steamid"):
-                if resp.get("interval") or resp.get("allowed_confirmations"):
-                    return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
-                return {"status": "success", "message": "Аккаунт работает"}
-        except Exception:
-            pass
-        conf = resp.get("allowed_confirmations") or []
-        if conf:
-            return {"status": "error", "message": "Не работает (Steam Guard / 2FA)"}
-        return {"status": "success", "message": "Аккаунт работает"}
-
-    eresult = resp.get("eresult") or data.get("eresult")
-    if eresult == 84:
-        return {"status": "error", "message": "Steam лимит — подождите 1–2 мин"}
     return {"status": "error", "message": "Аккаунт не работает"}
 
 
@@ -247,29 +284,48 @@ def check_steam(
     captcha_gid: str = "-1",
     captcha_text: str = "",
     session: requests.Session | None = None,
-    proxy_url: str | None = None,  # ignored, kept for call compatibility
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
-    sess = session or _session()
-    try:
-        sess.get(
-            "https://steamcommunity.com/login/home/?goto=",
-            timeout=12,
-            headers={"Referer": "https://steamcommunity.com/"},
-        )
-    except Exception:
-        pass
+    last = {"status": "error", "message": "Аккаунт не работает"}
 
-    rsa = _get_rsa(sess, username)
-    if not rsa:
-        return {"status": "error", "message": "Ошибка сети (RSA)"}
+    for ua in (UA_DESKTOP, UA_MOBILE):
+        sess = session or _session(ua)
+        try:
+            sess.get(
+                "https://steamcommunity.com/login/home/?goto=",
+                timeout=15,
+                headers={"Referer": "https://steamcommunity.com/"},
+            )
+        except Exception:
+            pass
 
-    r1 = _check_via_auth_service(sess, username, password, rsa)
-    if r1.get("status") == "success":
-        return r1
-    if "лимит" in (r1.get("message") or "") or "Guard" in (r1.get("message") or ""):
-        return r1
+        rsa = _get_rsa(sess, username)
+        if not rsa:
+            last = {"status": "error", "message": "Ошибка сети (RSA)"}
+            continue
 
-    r2 = _check_via_dologin(sess, username, password, rsa)
-    if r2.get("status") == "success":
-        return r2
-    return r2 if r2.get("status") == "error" else r1
+        r1 = _auth_service(sess, username, password, rsa)
+        if r1.get("status") == "success":
+            return r1
+        if r1.get("message") and "Guard" in r1["message"]:
+            return r1
+        if r1.get("message") and "лимит" in r1["message"]:
+            return r1
+        if r1.get("message") and r1["message"] != "auth_api_no_result":
+            if "не работает" in (r1.get("message") or "").lower():
+                # definitive bad password from API
+                return r1
+
+        r2 = _dologin(sess, username, password, rsa)
+        if r2.get("status") == "success":
+            return r2
+        last = r2
+        if "лимит" in (r2.get("message") or ""):
+            return r2
+        if "не работает" in (r2.get("message") or "").lower() and "IP" not in (r2.get("message") or ""):
+            return r2
+
+        # small pause before second UA
+        time.sleep(0.4)
+
+    return last

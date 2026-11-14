@@ -650,15 +650,43 @@ def page_kb(key: str, page: int) -> types.InlineKeyboardMarkup:
 
 
 def fmt_acc(a: dict, n: int | None = None) -> str:
+    """Account card: credentials are deliberately not printed in chat text."""
     head = f"<b>#{n}</b>\n" if n is not None else ""
     mark = get_check_mark(a.get("l") or "")
     mark_line = f"\n\n{mark}" if mark else ""
     return (
         f"{head}🎮 <b>{esc(a.get('g') or '—')}</b>\n\n"
-        f"👤 Логин:\n<code>{esc(a.get('l'))}</code>\n\n"
-        f"🔑 Пароль:\n<code>{esc(a.get('p'))}</code>"
+        "👤 Логин и 🔑 пароль доступны через кнопки ниже."
         f"{mark_line}"
     )
+
+
+def account_copy_kb(a: dict, idx: int | None = None, page: int = 0,
+                    in_fav: bool = False, private: bool = False) -> types.InlineKeyboardMarkup:
+    """Buttons that copy account credentials without exposing them in message text."""
+    kb = types.InlineKeyboardMarkup()
+    copy_type = getattr(types, "CopyTextButton", None)
+    login = str(a.get("l") or "")
+    password = str(a.get("p") or "")
+    if copy_type is not None:
+        if login:
+            kb.row(types.InlineKeyboardButton(
+                "👤 Скопировать логин",
+                copy_text=copy_type(text=login[:256]),
+            ))
+        if password:
+            kb.row(types.InlineKeyboardButton(
+                "🔑 Скопировать пароль",
+                copy_text=copy_type(text=password[:256]),
+            ))
+    else:
+        print("CopyTextButton unavailable: update pyTelegramBotAPI to >=4.29.0")
+    if private and idx is not None:
+        if not in_fav:
+            kb.add(types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fv:{idx}:{page}"))
+        else:
+            kb.add(types.InlineKeyboardButton("❌ Убрать из избранного", callback_data=f"fu:{idx}"))
+    return kb
 
 
 
@@ -783,18 +811,14 @@ def add_game_request(uid: int, username: str, game: str) -> None:
     save_requests(items[:200])
 
 
-def acc_kb_private(idx: int, page: int, in_fav: bool = False, with_check: bool = True) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup()
-    if not in_fav:
-        kb.add(types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fv:{idx}:{page}"))
-    else:
-        kb.add(types.InlineKeyboardButton("❌ Убрать из избранного", callback_data=f"fu:{idx}"))
-    return kb
+def acc_kb_private(idx: int, page: int, in_fav: bool = False, with_check: bool = True,
+                   account: dict | None = None) -> types.InlineKeyboardMarkup:
+    account = account or {}
+    return account_copy_kb(account, idx=idx, page=page, in_fav=in_fav, private=True)
 
 
-def acc_kb_public(idx: int, page: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup()
-    return kb
+def acc_kb_public(idx: int, page: int, account: dict | None = None) -> types.InlineKeyboardMarkup:
+    return account_copy_kb(account or {})
 
 
 def show_menu(
@@ -1207,9 +1231,9 @@ def cmd_random(message: types.Message):
         key = ctx_key(message.chat.id, uid)
         user_results[key] = {"list": [a], "q": f"random:{genre or 'all'}"}
         if message.chat.type == "private":
-            kb = acc_kb_private(0, 0, in_fav=False, with_check=True)
+            kb = acc_kb_private(0, 0, in_fav=False, with_check=True, account=a)
         else:
-            kb = acc_kb_public(0, 0)
+            kb = acc_kb_public(0, 0, account=a)
         bot.reply_to(message, title + "\n\n" + fmt_acc(a, 1), reply_markup=kb)
     except Exception as e:
         print("cmd_random error:", e)
@@ -1396,11 +1420,10 @@ def on_inline_query(query: types.InlineQuery):
         password = a.get("p") or "?"
         games = a.get("g") or "—"
         title = (games[:60] + "…") if len(games) > 60 else games
-        desc = f"{login}"
+        desc = "Логин и пароль копируются отдельными кнопками"
         body = (
             f"🎮 <b>{esc(games)}</b>\n\n"
-            f"👤 Логин:\n<code>{esc(login)}</code>\n\n"
-            f"🔑 Пароль:\n<code>{esc(password)}</code>"
+            "👤 Логин и 🔑 пароль доступны через кнопки ниже."
         )
         # id must be unique string 1-64 bytes
         rid = f"{i}_{hash(login) % 10_000_000}"
@@ -1414,6 +1437,7 @@ def on_inline_query(query: types.InlineQuery):
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 ),
+                reply_markup=account_copy_kb(a),
             )
         )
 
@@ -1702,17 +1726,55 @@ def on_callback(cq: types.CallbackQuery):
             return
 
         if action == "custom":
-            s = load_settings()
-            cmds = s.get("custom_commands") or {}
-            if cmds:
-                listing = "\\n".join(f"• <code>{esc(k)}</code>" for k in cmds)
-            else:
-                listing = "Пока нет команд."
+            cmds = load_settings().get("custom_commands") or {}
             kb = types.InlineKeyboardMarkup()
+            keys = sorted(str(k) for k in cmds.keys())
+            listing = "\n".join(f"• <code>{esc(k)}</code>" for k in keys) if keys else "Пока нет команд."
+            for i, key in enumerate(keys):
+                kb.row(
+                    types.InlineKeyboardButton(f"✏️ {key[:24]}", callback_data=f"adm:cmdedit:{i}"),
+                    types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm:cmddelete:{i}"),
+                )
             kb.add(types.InlineKeyboardButton("➕ Добавить команду", callback_data="adm:addcmd"))
             kb.add(types.InlineKeyboardButton("« Назад", callback_data="adm:panel"))
             bot.answer_callback_query(cq.id)
-            bot.send_message(chat_id, "⌨️ <b>Свои команды</b>\\n" + listing, reply_markup=kb)
+            bot.send_message(chat_id, "⌨️ <b>Свои команды</b>\n" + listing + "\n\nВыбери ✏️ для изменения или 🗑 для удаления.", reply_markup=kb)
+            return
+
+        if action.startswith("cmdedit:") or action.startswith("cmddelete:"):
+            try:
+                index = int(action.split(":", 1)[1])
+                current = load_settings().get("custom_commands") or {}
+                keys = sorted(str(k) for k in current.keys())
+                trigger = keys[index]
+            except (ValueError, IndexError, TypeError):
+                bot.answer_callback_query(cq.id, "Команда уже отсутствует. Обнови список.", show_alert=True)
+                return
+            if action.startswith("cmddelete:"):
+                st = load_settings()
+                commands = st.get("custom_commands") or {}
+                commands.pop(trigger, None)
+                st["custom_commands"] = commands
+                save_settings(st)
+                bot.answer_callback_query(cq.id, "Команда удалена")
+                remaining = sorted(str(k) for k in commands.keys())
+                kb = types.InlineKeyboardMarkup()
+                for i, key in enumerate(remaining):
+                    kb.row(
+                        types.InlineKeyboardButton(f"✏️ {key[:24]}", callback_data=f"adm:cmdedit:{i}"),
+                        types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm:cmddelete:{i}"),
+                    )
+                kb.add(types.InlineKeyboardButton("➕ Добавить команду", callback_data="adm:addcmd"))
+                kb.add(types.InlineKeyboardButton("« Назад", callback_data="adm:panel"))
+                body = "⌨️ <b>Свои команды</b>\n" + ("\n".join(f"• <code>{esc(k)}</code>" for k in remaining) or "Пока нет команд.")
+                try:
+                    bot.edit_message_text(body, chat_id, cq.message.message_id, reply_markup=kb)
+                except Exception:
+                    bot.send_message(chat_id, body, reply_markup=kb)
+                return
+            admin_wait[uid] = "custom_edit_content:" + trigger
+            bot.answer_callback_query(cq.id, "Режим изменения")
+            bot.send_message(chat_id, f"✏️ Изменение команды <code>{esc(trigger)}</code>.\nПришли новый текст или фото с подписью. Затем сможешь заменить кнопки. Отмена: /cancel")
             return
 
         if action == "addcmd":
@@ -1986,9 +2048,9 @@ def on_callback(cq: types.CallbackQuery):
         if cq.message and cq.message.chat.type == "private":
             favs = get_user_favs(uid)
             in_fav = any((x.get("l") or "").lower() == (a.get("l") or "").lower() for x in favs)
-            kb = acc_kb_private(idx, page, in_fav=in_fav, with_check=True)
+            kb = acc_kb_private(idx, page, in_fav=in_fav, with_check=True, account=a)
         else:
-            kb = acc_kb_public(idx, page)
+            kb = acc_kb_public(idx, page, account=a)
         bot.send_message(chat_id, fmt_acc(a, idx + 1), reply_markup=kb)
         bot.answer_callback_query(cq.id)
         return
@@ -2040,8 +2102,8 @@ def on_admin_photo(message: types.Message):
     if not is_admin(uid) or uid not in admin_wait:
         return
     step = admin_wait.pop(uid)
-    if step in ("welcome_content",) or step.startswith("custom_content:"):
-        if step.startswith("custom_content:"):
+    if step in ("welcome_content",) or step.startswith(("custom_content:", "custom_edit_content:")):
+        if step.startswith(("custom_content:", "custom_edit_content:")):
             trigger = step.split(":", 1)[1]
             payload = {"type": "photo", "file_id": message.photo[-1].file_id,
                        "caption": (message.caption or "")[:1000]}
@@ -2191,7 +2253,7 @@ def on_private_text(message: types.Message):
             admin_wait[uid] = "custom_content:" + trigger
             bot.reply_to(message, "Пришли текст или фото с подписью для команды.")
             return
-        if step.startswith("custom_content:"):
+        if step.startswith(("custom_content:", "custom_edit_content:")):
             trigger = step.split(":", 1)[1]
             payload = {"type": "text", "text": text[:4000]}
             st = load_settings()

@@ -1998,13 +1998,18 @@ def on_group_custom_command(message: types.Message):
 
     settings_now = load_settings()
     commands = settings_now.get("custom_commands") or {}
+    # Нормализуем сохранённый триггер так же, как входящее сообщение.
+    # Раньше `!info` сохранялся с `!`, а при обработке сообщения префикс
+    # удалялся, поэтому сравнение `!info` с `info` никогда не совпадало.
+    incoming = command_text.strip().lstrip("/!").split("@", 1)[0].casefold()
     for trigger, payload in commands.items():
-        saved_trigger = str(trigger).strip()
-        if saved_trigger.casefold() == command_text.casefold():
+        saved_trigger = str(trigger).strip().lstrip("/!").split("@", 1)[0].casefold()
+        if saved_trigger and saved_trigger == incoming:
             try:
                 send_payload(message.chat.id, payload)
+                print(f"custom command matched: {saved_trigger} in chat {message.chat.id}")
             except Exception as e:
-                print("custom command send failed:", e)
+                print("custom command send failed:", repr(e))
             return
 
 

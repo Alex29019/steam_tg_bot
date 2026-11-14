@@ -1469,23 +1469,42 @@ def save_admin_payload(uid: int, step: str, message) -> None:
 
 
 def make_payload_markup(lines: str):
-    """Кнопки-ссылки и кнопки копирования текста.
+    """Создаёт inline-кнопки двух видов:
 
-    Форматы:
-      Название | https://example.com
-      Скопировать код | copy:ТЕКСТ_КОТОРЫЙ_НУЖНО_СКОПИРОВАТЬ
+      Текст кнопки | https://example.com
+      Текст кнопки | любой текст для копирования | копировать
 
-    copy_text — штатная функция Telegram Bot API; текст копируется
-    в буфер обмена на устройстве пользователя после нажатия кнопки.
+    Во втором формате копируется именно среднее поле.
+    Старый формат `Текст кнопки | copy:ТЕКСТ` также оставлен для совместимости.
     """
     kb = types.InlineKeyboardMarkup()
     for line in (lines or "").splitlines():
-        if "|" not in line:
-            continue
-        label, action = [x.strip() for x in line.split("|", 1)]
-        if not label or not action:
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 2:
             continue
 
+        label = parts[0]
+        if not label:
+            continue
+
+        # Третий столбец `копировать` включает кнопку копирования.
+        if len(parts) >= 3 and parts[2].casefold() == "копировать":
+            copy_value = parts[1]
+            if not copy_value:
+                continue
+            copy_button_type = getattr(types, "CopyTextButton", None)
+            if copy_button_type is None:
+                raise RuntimeError(
+                    "Для кнопок копирования обнови pyTelegramBotAPI до версии 4.29.0 или новее"
+                )
+            kb.add(types.InlineKeyboardButton(
+                text=label[:64],
+                copy_text=copy_button_type(text=copy_value[:256]),
+            ))
+            continue
+
+        # Совместимость со старой записью `Название | copy:ТЕКСТ`.
+        action = parts[1]
         if action.startswith("copy:"):
             copy_value = action[5:].strip()
             if not copy_value:
@@ -1501,6 +1520,7 @@ def make_payload_markup(lines: str):
             ))
         elif action.startswith(("https://", "http://")):
             kb.add(types.InlineKeyboardButton(label[:64], url=action))
+
     return kb if kb.keyboard else None
 
 
@@ -1981,7 +2001,7 @@ def on_admin_photo(message: types.Message):
             st["pending_custom"] = {"trigger": trigger, "payload": payload}
             save_settings(st)
             admin_wait[uid] = "custom_buttons"
-            bot.reply_to(message, "Кнопки: Название | https://ссылка (по одной на строку), либо /skip.")
+            bot.reply_to(message, "Кнопки (каждая с новой строки): Текст | https://ссылка ИЛИ Текст | что копировать | копировать. Либо /skip.")
         else:
             save_admin_payload(uid, step, message)
 
@@ -2130,7 +2150,7 @@ def on_private_text(message: types.Message):
             st["pending_custom"] = {"trigger": trigger, "payload": payload}
             save_settings(st)
             admin_wait[uid] = "custom_buttons"
-            bot.reply_to(message, "Кнопки: Название | https://ссылка (по одной на строку), либо /skip.")
+            bot.reply_to(message, "Кнопки (каждая с новой строки): Текст | https://ссылка ИЛИ Текст | что копировать | копировать. Либо /skip.")
             return
         if step == "custom_buttons":
             st = load_settings()

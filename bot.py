@@ -1469,71 +1469,92 @@ def save_admin_payload(uid: int, step: str, message) -> None:
 
 
 def make_payload_markup(lines: str):
-    """Создаёт inline-кнопки двух видов:
+    """Build inline URL/copy buttons.
 
-      Текст кнопки | https://example.com
-      Текст кнопки | любой текст для копирования | копировать
-
-    Во втором формате копируется именно среднее поле.
-    Старый формат `Текст кнопки | copy:ТЕКСТ` также оставлен для совместимости.
+    Supported formats (one button per line):
+      Button title | https://example.com
+      https://example.com | Button title  (reverse order is also accepted)
+      Button title | text to copy | копировать
+      Button title | copy:TEXT
+      https://example.com Button title  (legacy convenient form)
     """
     kb = types.InlineKeyboardMarkup()
-    for line in (lines or "").splitlines():
-        parts = [part.strip() for part in line.split("|")]
-        if len(parts) < 2:
+    added = 0
+    copy_button_type = getattr(types, "CopyTextButton", None)
+
+    for raw_line in (lines or "").splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
 
-        label = parts[0]
-        if not label:
-            continue
+        parts = [part.strip().strip('"\'') for part in line.split("|")]
+        label = ""
+        action = ""
+        mode = "url"
 
-        # Третий столбец `копировать` включает кнопку копирования.
-        if len(parts) >= 3 and parts[2].casefold() == "копировать":
-            copy_value = parts[1]
-            if not copy_value:
+        if len(parts) >= 3 and parts[2].casefold() in ("копировать", "copy"):
+            label, action, mode = parts[0], parts[1], "copy"
+        elif len(parts) >= 2:
+            first, second = parts[0], parts[1]
+            if first.lower().startswith(("https://", "http://")):
+                action, label = first, second
+            else:
+                label, action = first, second
+        else:
+            # Also accept: https://example.com Button title
+            first_space = line.find(" ")
+            if first_space > 0 and line[:first_space].lower().startswith(("https://", "http://")):
+                action, label = line[:first_space].strip(), line[first_space + 1:].strip()
+            else:
                 continue
-            copy_button_type = getattr(types, "CopyTextButton", None)
+
+        if not label or not action:
+            continue
+
+        if mode == "copy" or action.casefold().startswith("copy:"):
+            if action.casefold().startswith("copy:"):
+                action = action[5:].strip()
+            if not action:
+                continue
             if copy_button_type is None:
-                raise RuntimeError(
-                    "Для кнопок копирования обнови pyTelegramBotAPI до версии 4.29.0 или новее"
-                )
+                print("CopyTextButton unavailable: update pyTelegramBotAPI to >=4.29.0")
+                continue
             kb.add(types.InlineKeyboardButton(
                 text=label[:64],
-                copy_text=copy_button_type(text=copy_value[:256]),
+                copy_text=copy_button_type(text=action[:256]),
             ))
+            added += 1
             continue
 
-        # Совместимость со старой записью `Название | copy:ТЕКСТ`.
-        action = parts[1]
-        if action.startswith("copy:"):
-            copy_value = action[5:].strip()
-            if not copy_value:
-                continue
-            copy_button_type = getattr(types, "CopyTextButton", None)
-            if copy_button_type is None:
-                raise RuntimeError(
-                    "Для кнопок копирования обнови pyTelegramBotAPI до версии 4.29.0 или новее"
-                )
-            kb.add(types.InlineKeyboardButton(
-                text=label[:64],
-                copy_text=copy_button_type(text=copy_value[:256]),
-            ))
-        elif action.startswith(("https://", "http://")):
-            kb.add(types.InlineKeyboardButton(label[:64], url=action))
+        if action.lower().startswith(("https://", "http://")):
+            kb.add(types.InlineKeyboardButton(text=label[:64], url=action[:2048]))
+            added += 1
+        else:
+            print(f"Skipped invalid custom button line: {raw_line!r}")
 
-    return kb if kb.keyboard else None
+    if lines and not added:
+        print("No valid inline buttons parsed. Input was:", repr(lines))
+    return kb if added else None
 
 
 def send_payload(chat_id: int, payload: dict):
     if not isinstance(payload, dict):
+        print("send_payload: invalid payload", repr(payload))
         return
-    kb = make_payload_markup(payload.get("buttons_text", ""))
-    if payload.get("type") == "photo" and payload.get("file_id"):
-        bot.send_photo(chat_id, payload["file_id"], caption=payload.get("caption", "")[:1024],
-                       reply_markup=kb, parse_mode="HTML")
-    elif payload.get("type") == "text":
-        bot.send_message(chat_id, payload.get("text", "")[:4000],
-                         reply_markup=kb, parse_mode="HTML")
+    buttons_text = payload.get("buttons_text", "") or ""
+    kb = make_payload_markup(buttons_text)
+    try:
+        if payload.get("type") == "photo" and payload.get("file_id"):
+            bot.send_photo(chat_id, payload["file_id"], caption=payload.get("caption", "")[:1024],
+                           reply_markup=kb, parse_mode="HTML")
+        elif payload.get("type") == "text":
+            bot.send_message(chat_id, payload.get("text", "")[:4000],
+                             reply_markup=kb, parse_mode="HTML")
+        else:
+            print("send_payload: unknown payload type", repr(payload.get("type")))
+    except Exception as e:
+        print("send_payload Telegram error:", repr(e))
+        raise
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -2028,7 +2049,7 @@ def on_admin_photo(message: types.Message):
             st["pending_custom"] = {"trigger": trigger, "payload": payload}
             save_settings(st)
             admin_wait[uid] = "custom_buttons"
-            bot.reply_to(message, "Кнопки (каждая с новой строки): Текст | https://ссылка ИЛИ Текст | что копировать | копировать. Либо /skip.")
+            bot.reply_to(message, "Кнопки (каждая с новой строки): Название | https://ссылка. Для копирования: Название | текст | копировать. Можно также URL | Название. Либо /skip.")
         else:
             save_admin_payload(uid, step, message)
 
@@ -2177,7 +2198,7 @@ def on_private_text(message: types.Message):
             st["pending_custom"] = {"trigger": trigger, "payload": payload}
             save_settings(st)
             admin_wait[uid] = "custom_buttons"
-            bot.reply_to(message, "Кнопки (каждая с новой строки): Текст | https://ссылка ИЛИ Текст | что копировать | копировать. Либо /skip.")
+            bot.reply_to(message, "Кнопки (каждая с новой строки): Название | https://ссылка. Для копирования: Название | текст | копировать. Можно также URL | Название. Либо /skip.")
             return
         if step == "custom_buttons":
             st = load_settings()

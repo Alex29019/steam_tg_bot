@@ -183,6 +183,9 @@ def load_settings() -> dict:
         "Я бот для поиска аккаунтов, напиши команду /accfree "
         "что бы получить доступ к 2к+ акков",
     )
+    s.setdefault("welcome_enabled", False)
+    s.setdefault("welcome_payload", {})
+    s.setdefault("custom_commands", {})
     return s
 
 
@@ -895,6 +898,8 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("📤 Авто-текст в выбранные", callback_data="adm:test"))
     kb.add(types.InlineKeyboardButton("👥 Отметить людей", callback_data="adm:mention"))
     kb.add(types.InlineKeyboardButton("🎁 Создать розыгрыш", callback_data="adm:giveaway"))
+    kb.add(types.InlineKeyboardButton("👋 Приветствие новых", callback_data="adm:welcome"))
+    kb.add(types.InlineKeyboardButton("⌨️ Свои команды", callback_data="adm:custom"))
     kb.add(types.InlineKeyboardButton("🚫 Забанить", callback_data="adm:ban"))
     kb.add(types.InlineKeyboardButton("✅ Разбанить", callback_data="adm:unban"))
     kb.add(types.InlineKeyboardButton("📋 Список банов", callback_data="adm:banlist"))
@@ -1436,6 +1441,81 @@ def on_inline_query(query: types.InlineQuery):
         print("inline error:", e)
 
 
+def save_admin_payload(uid: int, step: str, message) -> None:
+    """Сохраняет текст/фото для приветствия или кастомной команды и просит кнопки."""
+    payload = {}
+    if getattr(message, "photo", None):
+        payload = {"type": "photo", "file_id": message.photo[-1].file_id,
+                   "caption": (message.caption or "")[:1000]}
+    elif getattr(message, "text", None):
+        payload = {"type": "text", "text": message.text[:4000]}
+    else:
+        bot.reply_to(message, "Пришли текст или фото с подписью.")
+        admin_wait[uid] = step
+        return
+
+    if step == "welcome_content":
+        temp_key = "pending_welcome"
+    else:
+        temp_key = "pending_custom"
+    # pending данные храним в settings, чтобы пережить несколько gunicorn workers
+    st = load_settings()
+    st[temp_key] = payload
+    save_settings(st)
+    admin_wait[uid] = "welcome_buttons" if step == "welcome_content" else "custom_buttons"
+    bot.reply_to(message,
+        "Теперь отправь кнопки в формате: Название | https://ссылка (каждая с новой строки).\\n"
+        "Если кнопки не нужны — отправь /skip. Отмена: /cancel")
+
+
+def make_payload_markup(lines: str):
+    """Кнопки-ссылки и кнопки копирования текста.
+
+    Форматы:
+      Название | https://example.com
+      Скопировать код | copy:ТЕКСТ_КОТОРЫЙ_НУЖНО_СКОПИРОВАТЬ
+
+    copy_text — штатная функция Telegram Bot API; текст копируется
+    в буфер обмена на устройстве пользователя после нажатия кнопки.
+    """
+    kb = types.InlineKeyboardMarkup()
+    for line in (lines or "").splitlines():
+        if "|" not in line:
+            continue
+        label, action = [x.strip() for x in line.split("|", 1)]
+        if not label or not action:
+            continue
+
+        if action.startswith("copy:"):
+            copy_value = action[5:].strip()
+            if not copy_value:
+                continue
+            copy_button_type = getattr(types, "CopyTextButton", None)
+            if copy_button_type is None:
+                raise RuntimeError(
+                    "Для кнопок копирования обнови pyTelegramBotAPI до версии 4.29.0 или новее"
+                )
+            kb.add(types.InlineKeyboardButton(
+                text=label[:64],
+                copy_text=copy_button_type(text=copy_value[:256]),
+            ))
+        elif action.startswith(("https://", "http://")):
+            kb.add(types.InlineKeyboardButton(label[:64], url=action))
+    return kb if kb.keyboard else None
+
+
+def send_payload(chat_id: int, payload: dict):
+    if not isinstance(payload, dict):
+        return
+    kb = make_payload_markup(payload.get("buttons_text", ""))
+    if payload.get("type") == "photo" and payload.get("file_id"):
+        bot.send_photo(chat_id, payload["file_id"], caption=payload.get("caption", "")[:1024],
+                       reply_markup=kb, parse_mode="HTML")
+    elif payload.get("type") == "text":
+        bot.send_message(chat_id, payload.get("text", "")[:4000],
+                         reply_markup=kb, parse_mode="HTML")
+
+
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(cq: types.CallbackQuery):
     data = cq.data or ""
@@ -1573,6 +1653,32 @@ def on_callback(cq: types.CallbackQuery):
             return
 
 
+
+        if action == "welcome":
+            admin_wait[uid] = "welcome_content"
+            bot.answer_callback_query(cq.id)
+            bot.send_message(chat_id, "👋 Пришли текст или фото с подписью для приветствия новых участников. HTML поддерживается. Отмена: /cancel")
+            return
+
+        if action == "custom":
+            s = load_settings()
+            cmds = s.get("custom_commands") or {}
+            if cmds:
+                listing = "\\n".join(f"• <code>{esc(k)}</code>" for k in cmds)
+            else:
+                listing = "Пока нет команд."
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("➕ Добавить команду", callback_data="adm:addcmd"))
+            kb.add(types.InlineKeyboardButton("« Назад", callback_data="adm:panel"))
+            bot.answer_callback_query(cq.id)
+            bot.send_message(chat_id, "⌨️ <b>Свои команды</b>\\n" + listing, reply_markup=kb)
+            return
+
+        if action == "addcmd":
+            admin_wait[uid] = "custom_name"
+            bot.answer_callback_query(cq.id)
+            bot.send_message(chat_id, "Введи команду без /, например <code>rules</code> или <code>!info</code>. Отмена: /cancel")
+            return
 
         if action == "giveaway":
             admin_wait[uid] = "giveaway_code"
@@ -1847,6 +1953,55 @@ def on_callback(cq: types.CallbackQuery):
         return
 
 
+@bot.message_handler(func=lambda m: bool(m.text) and m.chat.type in ("group", "supergroup") and not m.text.startswith("/"))
+def on_group_custom_command(message: types.Message):
+    if reject_if_banned(message):
+        return
+    remember_chat(message.chat.id, message.chat.type)
+    text = (message.text or "").strip()
+    settings_now = load_settings()
+    for trigger, payload in (settings_now.get("custom_commands") or {}).items():
+        if text.casefold() == str(trigger).casefold():
+            send_payload(message.chat.id, payload)
+            return
+
+
+@bot.message_handler(content_types=["photo"], func=lambda m: m.chat.type == "private")
+def on_admin_photo(message: types.Message):
+    uid = message.from_user.id if message.from_user else 0
+    if not is_admin(uid) or uid not in admin_wait:
+        return
+    step = admin_wait.pop(uid)
+    if step in ("welcome_content",) or step.startswith("custom_content:"):
+        if step.startswith("custom_content:"):
+            trigger = step.split(":", 1)[1]
+            payload = {"type": "photo", "file_id": message.photo[-1].file_id,
+                       "caption": (message.caption or "")[:1000]}
+            st = load_settings()
+            st["pending_custom"] = {"trigger": trigger, "payload": payload}
+            save_settings(st)
+            admin_wait[uid] = "custom_buttons"
+            bot.reply_to(message, "Кнопки: Название | https://ссылка (по одной на строку), либо /skip.")
+        else:
+            save_admin_payload(uid, step, message)
+
+
+@bot.message_handler(content_types=["new_chat_members"])
+def welcome_new_members(message: types.Message):
+    remember_chat(message.chat.id, message.chat.type)
+    st = load_settings()
+    if not st.get("welcome_enabled"):
+        return
+    payload = st.get("welcome_payload") or {}
+    for member in message.new_chat_members or []:
+        if getattr(member, "is_bot", False):
+            continue
+        try:
+            send_payload(message.chat.id, payload)
+        except Exception as e:
+            print("welcome send failed:", e)
+
+
 @bot.message_handler(commands=["подарок", "Подарок", "gift"])
 def cmd_giveaway(message: types.Message):
     if reject_if_banned(message):
@@ -1934,6 +2089,13 @@ def on_private_text(message: types.Message):
     uid = message.from_user.id
     text = (message.text or "").strip()
 
+    # Пользовательские команды (личка)
+    settings_now = load_settings()
+    for trigger, payload in (settings_now.get("custom_commands") or {}).items():
+        if text.casefold() == str(trigger).casefold():
+            send_payload(message.chat.id, payload)
+            return
+
     # 1) ввод секрета — только в личке, без упоминаний в help
     if not is_admin(uid) and secret_ok(text):
         admin_sessions.add(uid)
@@ -1952,6 +2114,50 @@ def on_private_text(message: types.Message):
     # 2) шаги админки
     if is_admin(uid) and uid in admin_wait:
         step = admin_wait.pop(uid)
+        if step == "custom_name":
+            trigger = text.strip()
+            if not trigger or len(trigger) > 40 or trigger.startswith("/"):
+                bot.reply_to(message, "Команда должна быть до 40 символов и без начального /. Повтори.")
+                admin_wait[uid] = "custom_name"
+                return
+            admin_wait[uid] = "custom_content:" + trigger
+            bot.reply_to(message, "Пришли текст или фото с подписью для команды.")
+            return
+        if step.startswith("custom_content:"):
+            trigger = step.split(":", 1)[1]
+            payload = {"type": "text", "text": text[:4000]}
+            st = load_settings()
+            st["pending_custom"] = {"trigger": trigger, "payload": payload}
+            save_settings(st)
+            admin_wait[uid] = "custom_buttons"
+            bot.reply_to(message, "Кнопки: Название | https://ссылка (по одной на строку), либо /skip.")
+            return
+        if step == "custom_buttons":
+            st = load_settings()
+            pending = st.pop("pending_custom", {})
+            if not isinstance(pending, dict) or not pending.get("trigger"):
+                bot.reply_to(message, "Черновик команды потерян. Начни заново.")
+                return
+            payload = pending.get("payload") or {}
+            payload["buttons_text"] = "" if text == "/skip" else text
+            commands = st.get("custom_commands") or {}
+            commands[pending["trigger"]] = payload
+            st["custom_commands"] = commands
+            save_settings(st)
+            bot.reply_to(message, f"✅ Команда <code>{esc(pending['trigger'])}</code> сохранена.", reply_markup=admin_kb())
+            return
+        if step == "welcome_buttons":
+            st = load_settings()
+            payload = st.pop("pending_welcome", {})
+            payload["buttons_text"] = "" if text == "/skip" else text
+            st["welcome_payload"] = payload
+            st["welcome_enabled"] = True
+            save_settings(st)
+            bot.reply_to(message, "✅ Приветствие сохранено и включено.", reply_markup=admin_kb())
+            return
+        if step == "welcome_content":
+            save_admin_payload(uid, step, message)
+            return
         if step == "giveaway_code":
             code = text.strip()
             if not code or len(code) > 64 or any(ch.isspace() or ch == ":" for ch in code):

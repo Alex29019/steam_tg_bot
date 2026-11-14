@@ -383,7 +383,7 @@ try:
             kwargs["session"] = session
         r = _check_steam_noca(username, password, **kwargs)
         if isinstance(r, dict) and r.get("status") == "captcha":
-            return {"status": "error", "message": "Steam risk (no captcha flow) — повторите позже"}
+            return {"status": "error", "message": r.get("message") or "Steam блок IP"}
         return r
     print("steam_check: captcha-free override ON")
 except Exception as _e:

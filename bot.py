@@ -1973,16 +1973,38 @@ def on_callback(cq: types.CallbackQuery):
         return
 
 
-@bot.message_handler(func=lambda m: bool(m.text) and m.chat.type in ("group", "supergroup") and not m.text.startswith("/"))
+@bot.message_handler(func=lambda m: bool(m.text) and m.chat.type in ("group", "supergroup"))
 def on_group_custom_command(message: types.Message):
+    """Пользовательские команды в группах: /rules, !rules или rules.
+
+    Для /команд бот получает обновления и при включённом Privacy Mode.
+    Для !команд/обычного текста Privacy Mode нужно отключить в BotFather.
+    """
     if reject_if_banned(message):
         return
     remember_chat(message.chat.id, message.chat.type)
-    text = (message.text or "").strip()
+    raw_text = (message.text or "").strip()
+    if not raw_text:
+        return
+
+    # Удаляем префикс / или ! и необязательное @имя_бота у slash-команды.
+    command_text = raw_text
+    if command_text.startswith("/") or command_text.startswith("!"):
+        command_text = command_text[1:].split(None, 1)[0]
+        command_text = command_text.split("@", 1)[0]
+    else:
+        # Для текстовых триггеров не используем дополнительные аргументы.
+        command_text = command_text.split(None, 1)[0]
+
     settings_now = load_settings()
-    for trigger, payload in (settings_now.get("custom_commands") or {}).items():
-        if text.casefold() == str(trigger).casefold():
-            send_payload(message.chat.id, payload)
+    commands = settings_now.get("custom_commands") or {}
+    for trigger, payload in commands.items():
+        saved_trigger = str(trigger).strip()
+        if saved_trigger.casefold() == command_text.casefold():
+            try:
+                send_payload(message.chat.id, payload)
+            except Exception as e:
+                print("custom command send failed:", e)
             return
 
 
@@ -2164,7 +2186,14 @@ def on_private_text(message: types.Message):
             commands[pending["trigger"]] = payload
             st["custom_commands"] = commands
             save_settings(st)
-            bot.reply_to(message, f"✅ Команда <code>{esc(pending['trigger'])}</code> сохранена.", reply_markup=admin_kb())
+            bot.reply_to(
+                message,
+                f"✅ Команда <code>{esc(pending['trigger'])}</code> сохранена.\n\n"
+                f"В группе вызывай её так: <code>/{esc(pending['trigger'])}</code> "
+                f"или <code>!{esc(pending['trigger'])}</code>.\n"
+                "Если вариант с ! не срабатывает, отключи Privacy Mode через @BotFather.",
+                reply_markup=admin_kb(),
+            )
             return
         if step == "welcome_buttons":
             st = load_settings()
